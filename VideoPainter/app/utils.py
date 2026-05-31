@@ -27,7 +27,12 @@ from openai import OpenAI
 from diffusers.utils import export_to_video, load_image, load_video
 from PIL import Image
 from safetensors import safe_open
+from frame_conditioning import build_first_frame_ground_truth_masks, build_masked_video_frames, finalize_propagation_sequence
 from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
+
+# The VideoPainterID reference pipeline uses a non-zero previous-clip weight to
+# preserve object identity after first-frame replacement.
+REFERENCE_PREV_CLIP_WEIGHT = 0.5
 
 def load_model(
     model_path,
@@ -98,6 +103,16 @@ def load_model(
     return pipe, pipe_img_inpainting
 
 
+def build_reference_propagation_prompt(video_caption, target_object_caption):
+    video_caption = str(video_caption or "").strip()
+    target_object_caption = str(target_object_caption or "").strip()
+    if not target_object_caption:
+        return video_caption
+    if not video_caption:
+        return f"Focus on keeping the replacement object as {target_object_caption}."
+    return f"{video_caption} Focus on keeping the replacement object as {target_object_caption}."
+
+
 def generate_frames(
         images,
         masks,
@@ -110,6 +125,12 @@ def generate_frames(
         dilate_size=16,
         first_frame_override=None,
         progress_callback=None,
+        return_full_sequence=False,
+        prev_clip_weight=0.0,
+        id_pool_resample_learnable=None,
+        guide_images=None,
+        guide_mode="none",
+        guide_dilate_size=None,
     ):
     """
     Generate inpainted video frames.
@@ -138,12 +159,17 @@ def generate_frames(
     # for i in range(len(masks)):
     #     masks[i].save(f"{GRADIO_TEMP_DIR}/inpaint/mask_{i:03d}.png")
 
-    report_progress(current_step, total_steps, f"Dilating masks ({dilate_size}px)...")
+    effective_dilate_size = dilate_size
+    if guide_images is not None and guide_mode != "none" and guide_dilate_size is not None:
+        effective_dilate_size = guide_dilate_size
+
+    report_progress(current_step, total_steps, f"Dilating masks ({effective_dilate_size}px)...")
     current_step += 5
 
-    print(f"Dilating the mask with size {dilate_size}...")
+    print(f"Dilating the mask with size {effective_dilate_size}...")
     for i in range(len(masks)):
-        mask = cv2.dilate(np.array(masks[i]), np.ones((dilate_size, dilate_size)))
+        kernel_size = max(1, int(effective_dilate_size))
+        mask = cv2.dilate(np.array(masks[i]), np.ones((kernel_size, kernel_size)))
         mask = mask.astype(np.uint8)
         mask = Image.fromarray(mask)
         masks[i] = mask
@@ -215,6 +241,24 @@ def generate_frames(
         images[0] = first_frame_override.resize(images[0].size).convert("RGB")
         print(f"Using externally edited first frame: {np.array(images[0]).shape}")
 
+    if id_pool_resample_learnable is None:
+        id_pool_resample_learnable = first_frame_override is not None
+
+    conditioning_masks = build_first_frame_ground_truth_masks(masks, mask_background=False) if first_frame_override is not None else masks
+    conditioning_images = images
+    if guide_images is not None and guide_mode != "none":
+        if len(guide_images) != len(images):
+            raise ValueError(f"guide_images must have {len(images)} frames, got {len(guide_images)}")
+        conditioning_images = [img.resize(images[0].size).convert("RGB") for img in guide_images]
+        conditioning_images[0] = images[0].copy()
+    if guide_images is not None and guide_mode != "none":
+        # Guide frames already carry the replacement object's color/identity.
+        # Keep those pixels visible; masks are still passed separately to the video model.
+        masked_video = [img.copy() for img in conditioning_images]
+    else:
+        masked_video = build_masked_video_frames(conditioning_images, conditioning_masks, mask_background=False)
+    masked_video[0] = images[0].copy()
+
     # save the first frame (only if FLUX inpainting was used)
     if first_frame_override is None:
         images[0].save(f"{GRADIO_TEMP_DIR}/inpaint/first_frame_inpainted.png")
@@ -231,30 +275,30 @@ def generate_frames(
 
     inpaint_outputs = pipe(
         prompt=prompt,
-        image=images[0],
+        image=masked_video[0],
         num_videos_per_prompt=1,
         num_inference_steps=50,
         num_frames=49,
         use_dynamic_cfg=True,
         guidance_scale=cfg_scale,
         generator=torch.Generator().manual_seed(seed),
-        video=images,
-        masks=masks,
+        video=masked_video,
+        masks=conditioning_masks,
         strength=1.0,
         replace_gt=True,
         mask_add=True,
         stride=int(49 - 0), # int(frames - down_sample_fps), frames,
-        prev_clip_weight=0.0,
-        id_pool_resample_learnable=False,
+        prev_clip_weight=prev_clip_weight,
+        id_pool_resample_learnable=id_pool_resample_learnable,
         output_type="np",
         callback_on_step_end=callback_on_step_end,
     ).frames[0]
-    inpaint_outputs = inpaint_outputs[1:]
+    outputs = inpaint_outputs if return_full_sequence else inpaint_outputs[1:]
 
     report_progress(total_steps, total_steps, "CogVideoX propagation complete")
-    print(f"Video inpainting done! {np.array(inpaint_outputs).shape}, {np.array(inpaint_outputs).min()}, {np.array(inpaint_outputs).max()}")
+    print(f"Video inpainting done! {np.array(outputs).shape}, {np.array(outputs).min()}, {np.array(outputs).max()}")
     torch.cuda.empty_cache()
-    return inpaint_outputs
+    return outputs
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

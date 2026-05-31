@@ -243,3 +243,12 @@ processed_videos/
 temp_*.mp4
 temp_*.avi
 
+
+docs/
+inputs/
+runs/
+tests/
+VideoPainter/app/tmp_gradio
+VideoPainter/ckpt/sketch_ref
+instruction.md
+

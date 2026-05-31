@@ -80,5 +80,5 @@ model:
 
     cond_stage_config:
       target: ldm.modules.encoders.modules.FrozenDinoV2Encoder
-      weight: /root/autodl-tmp/AnyDoor/checkpoints/dinov2_vitg14_pretrain.pth
+      weight: /root/autodl-tmp/VideoEditor/AnyDoor/checkpoints/dinov2_vitg14_pretrain.pth
     

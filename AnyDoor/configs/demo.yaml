@@ -1,4 +1,4 @@
-pretrained_model: /root/autodl-tmp/AnyDoor/checkpoints/epoch=1-step=8687-pruned.ckpt
+pretrained_model: /root/autodl-tmp/VideoEditor/AnyDoor/checkpoints/epoch=1-step=8687-pruned.ckpt
 config_file: configs/anydoor.yaml
 save_memory: False
 use_interactive_seg: True

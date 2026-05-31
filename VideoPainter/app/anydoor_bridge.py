@@ -2,13 +2,14 @@ import importlib
 import os
 import sys
 from contextlib import contextmanager
+from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
 
 
-DEFAULT_ANYDOOR_ROOT = "/root/autodl-tmp/AnyDoor"
+DEFAULT_ANYDOOR_ROOT = os.environ.get("ANYDOOR_ROOT", str(Path(__file__).resolve().parents[2] / "AnyDoor"))
 
 
 @contextmanager

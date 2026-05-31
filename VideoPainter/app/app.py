@@ -22,9 +22,12 @@ import gradio as gr
 from sam2.build_sam import build_sam2_video_predictor, build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-from utils import load_model, generate_frames
+from frame_conditioning import build_edge_refine_masks, composite_object_guide_frames, finalize_propagation_sequence, mask_bbox, mask_bbox_trajectory, smooth_mask_bboxes
+from reference_segmenter import clean_binary_mask, detect_object_box_with_grounding_dino, segment_box_with_sam2
+from utils import REFERENCE_PREV_CLIP_WEIGHT, build_reference_propagation_prompt, load_model, generate_frames
 import threading
 from anydoor_bridge import replace_first_frame_with_anydoor
+from sketch_reference_workflow import build_reference_preview, generate_reference_assets, load_reference_assets_for_ui
 
 # Gradio temp directory (absolute path)
 GRADIO_TEMP_DIR = os.path.abspath(os.environ.get("GRADIO_TEMP_DIR", "./tmp_gradio"))
@@ -32,6 +35,30 @@ os.makedirs(GRADIO_TEMP_DIR, exist_ok=True)
 os.makedirs(os.path.join(GRADIO_TEMP_DIR, "track"), exist_ok=True)
 os.makedirs(os.path.join(GRADIO_TEMP_DIR, "inpaint"), exist_ok=True)
 os.environ["GRADIO_TEMP_DIR"] = GRADIO_TEMP_DIR
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+SKETCH_REF_CACHE_DIR = os.path.abspath(os.path.join(APP_DIR, "..", "ckpt", "sketch_ref"))
+os.makedirs(SKETCH_REF_CACHE_DIR, exist_ok=True)
+
+
+def build_target_bboxes_for_guides_ui(target_masks, smoothing_mode="off", smoothing_window=5, max_scale_delta=0.08, output_size=(720, 480)):
+    raw_bboxes = [mask_bbox(mask) for mask in target_masks]
+    if smoothing_mode == "median":
+        return smooth_mask_bboxes(
+            raw_bboxes,
+            image_size=output_size,
+            window=int(smoothing_window),
+            max_scale_delta=float(max_scale_delta),
+        )
+    return raw_bboxes
+
+
+def save_mask_bbox_diagnostics_ui(path, target_masks, target_bboxes):
+    payload = {
+        "raw": mask_bbox_trajectory(target_masks),
+        "used_bboxes": [None if box is None else [int(v) for v in box] for box in target_bboxes],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
 
 # Increase Gradio timeouts for long-running SAM2 operations
 os.environ.setdefault("GRADIO_TIMEOUT", "900")
@@ -122,6 +149,94 @@ def update_status(previous_status, new_message, message_type=StatusMessage.INFO)
     """Update status for HighlightedText component."""
     return [(new_message, message_type)]
 
+
+def _mask_bbox(mask):
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    if binary.ndim == 3:
+        binary = binary[..., 0]
+    ys, xs = np.where(binary > 0)
+    if len(xs) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def fit_reference_mask_to_target_bbox(reference_mask, target_mask, output_size=(720, 480)):
+    ref = clean_binary_mask(reference_mask)
+    target = (np.asarray(target_mask) > 0).astype(np.uint8)
+    if target.ndim == 3:
+        target = target[..., 0]
+    ref_bbox = _mask_bbox(ref)
+    target_bbox = _mask_bbox(target)
+    if ref_bbox is None or target_bbox is None:
+        raise RuntimeError("Cannot fit reference mask because a source mask is empty")
+
+    rx0, ry0, rx1, ry1 = ref_bbox
+    tx0, ty0, tx1, ty1 = target_bbox
+    ref_crop = (ref[ry0 : ry1 + 1, rx0 : rx1 + 1] > 0).astype(np.uint8) * 255
+    tw = tx1 - tx0 + 1
+    th = ty1 - ty0 + 1
+    scale = min(tw / max(ref_crop.shape[1], 1), th / max(ref_crop.shape[0], 1))
+    new_w = max(1, int(round(ref_crop.shape[1] * scale)))
+    new_h = max(1, int(round(ref_crop.shape[0] * scale)))
+    resized = cv2.resize(ref_crop, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
+    canvas = np.zeros((output_size[1], output_size[0]), dtype=np.uint8)
+    cx = int(round((tx0 + tx1) / 2.0))
+    cy = int(round((ty0 + ty1) / 2.0))
+    x0 = max(0, min(output_size[0] - new_w, cx - new_w // 2))
+    y0 = max(0, min(output_size[1] - new_h, cy - new_h // 2))
+    canvas[y0 : y0 + new_h, x0 : x0 + new_w] = resized
+    return clean_binary_mask(canvas)
+
+
+def segment_anydoor_object_mask_for_ui(image, label):
+    label = str(label or "").strip()
+    if not label:
+        raise ValueError("Target region caption is empty")
+    image = image if isinstance(image, Image.Image) else Image.fromarray(np.asarray(image).astype(np.uint8)).convert("RGB")
+    detection = detect_object_box_with_grounding_dino(image, label, cache_dir=SKETCH_REF_CACHE_DIR, device="cuda")
+    if detection is None:
+        raise RuntimeError(f"Could not detect replacement object in AnyDoor first frame: {label}")
+    return segment_box_with_sam2(image, detection["box"], image_predictor)
+
+
+def track_masks_from_initial_mask(frames, initial_mask, dilate_iter=6):
+    state = predictor.init_state(images=frames, offload_video_to_cpu=True, async_loading_frames=True)
+    init = (np.asarray(initial_mask) > 0).astype(np.uint8)
+    if init.ndim == 3:
+        init = init[..., 0]
+    if init.max() == 0:
+        raise RuntimeError("Initial propagation mask is empty")
+    predictor.add_new_mask(
+        inference_state=state,
+        frame_idx=0,
+        obj_id=0,
+        mask=init,
+    )
+    masks = []
+    for _, _, logits in predictor.propagate_in_video(state):
+        mask = np.zeros((480, 720, 1), dtype=np.float32)
+        for logit in logits:
+            mask += (logit.cpu().squeeze().detach().numpy() > 0).astype(np.float32)[:, :, None]
+        mask = (mask > 0.5).astype(np.uint8)
+        if dilate_iter > 0:
+            mask = scipy.ndimage.binary_dilation(mask, iterations=dilate_iter).astype(np.uint8)
+        masks.append(mask)
+    masks = np.asarray(masks, dtype=np.uint8)
+    if masks.max() == 0:
+        raise RuntimeError("Propagation mask tracking returned an empty mask sequence")
+    return masks
+
+
+def fit_object_mask_to_video_motion(object_mask, video_masks):
+    fitted = []
+    for video_mask in video_masks:
+        fitted_mask = fit_reference_mask_to_target_bbox(object_mask, video_mask, output_size=(720, 480))
+        fitted.append((fitted_mask > 0).astype(np.uint8)[:, :, None])
+    masks = np.asarray(fitted, dtype=np.uint8)
+    if masks.max() == 0:
+        raise RuntimeError("Object-shaped propagation mask sequence is empty")
+    return masks
 
 # =============================================================================
 # Video Processing Functions
@@ -376,6 +491,64 @@ def semantic_segment_reference(ref_image, point_prompt, click_state, evt: gr.Sel
     return painted_image, click_state, mask
 
 
+def generate_reference_from_sketch(sketch_image, video_state, label, attrs, candidate_count, reference_num_inference_steps, reference_guidance_scale, reference_controlnet_scale, seed_param, previous_status):
+    """Generate a reference image/mask pair from sketch input and reuse current reference UI state."""
+    if sketch_image is None:
+        return None, None, [[], []], None, update_status(previous_status, "Please upload a sketch first.", StatusMessage.ERROR)
+
+    clean_label = str(label).strip()
+    if not clean_label:
+        return None, None, [[], []], None, update_status(previous_status, "Object label is required for sketch mode.", StatusMessage.ERROR)
+
+    seed = int(seed_param) if int(seed_param) >= 0 else -1
+    run_dir = os.path.join(GRADIO_TEMP_DIR, "sketch_ref", str(int(time.time() * 1000)))
+    os.makedirs(run_dir, exist_ok=True)
+
+    try:
+        sketch_pil = Image.fromarray(np.asarray(sketch_image, dtype=np.uint8)).convert("RGB")
+        target_mask_for_shape = None
+        if video_state is not None and video_state.get("masks") is not None and len(video_state["masks"]) > 0:
+            target_mask_for_shape = (np.squeeze(video_state["masks"][0]) > 0).astype(np.uint8) * 255
+        result = generate_reference_assets(
+            sketch_image=sketch_pil,
+            label=clean_label,
+            attrs=attrs,
+            output_dir=run_dir,
+            cache_dir=SKETCH_REF_CACHE_DIR,
+            sam2_cfg="sam2_hiera_l.yaml",
+            sam2_ckpt=args.sam2_checkpoint,
+            device="cuda",
+            candidate_count=int(candidate_count),
+            seed=seed,
+            reference_num_inference_steps=int(reference_num_inference_steps),
+            reference_guidance_scale=float(reference_guidance_scale),
+            reference_controlnet_scale=float(reference_controlnet_scale),
+            allow_missing_mask=True,
+            target_mask_for_shape=target_mask_for_shape,
+            shape_compatibility_weight=0.25,
+        )
+        ref_image, ref_mask = load_reference_assets_for_ui(
+            result["reference_image_path"],
+            result["reference_mask_path"],
+        )
+        preview = build_reference_preview(ref_image, ref_mask)
+        if ref_mask is None:
+            status = update_status(
+                previous_status,
+                "Reference image generated, but auto segmentation failed. Click the reference image to create the mask manually.",
+                StatusMessage.WARNING,
+            )
+        else:
+            status = update_status(
+                previous_status,
+                "Reference image and mask generated from sketch. You can still click the reference image to refine the mask.",
+                StatusMessage.SUCCESS,
+            )
+        return ref_image, preview, [[], []], ref_mask, status
+    except Exception as exc:
+        return None, None, [[], []], None, update_status(previous_status, f"Sketch generation failed: {exc}", StatusMessage.ERROR)
+
+
 def inpaint_video_background(video_state, video_caption, target_region_caption, previous_status, seed_param, cfg_scale, dilate_size):
     """Inpaint video - runs in background, returns immediately."""
     if video_state is None or video_state["origin_images"] is None:
@@ -445,10 +618,12 @@ def inpaint_video_background(video_state, video_caption, target_region_caption, 
             print("Processing complete!")
             images = (images * 255).astype(np.uint8)
 
-            # Trim output to original frame count
+            # Trim output to original frame count while preserving the propagated first frame.
             original_count = video_state.get("original_frame_count", len(images))
             if len(images) > original_count:
                 images = images[:original_count]
+
+            Image.fromarray(images[0]).save(os.path.join(GRADIO_TEMP_DIR, "inpaint", "first_frame_propagated.png"))
 
             # Generate output video
             with processing_lock:
@@ -482,7 +657,7 @@ def inpaint_video_background(video_state, video_caption, target_region_caption, 
            update_status(previous_status, "Processing in background... Click 'Load Latest Result' when done.", StatusMessage.INFO)
 
 
-def exact_replace_video_background(video_state, ref_image_input, ref_mask, video_caption, previous_status, seed_param, cfg_scale, dilate_size, anydoor_guidance_scale):
+def exact_replace_video_background(video_state, ref_image_input, ref_mask, video_caption, target_region_caption, previous_status, seed_param, cfg_scale, dilate_size, anydoor_guidance_scale, reference_motion_guide, guide_dilate_size, mask_bbox_smoothing, mask_bbox_smoothing_window, mask_bbox_max_scale_delta, save_mask_bbox_stats):
     """Exact object replacement - runs in background, returns immediately."""
     seed = int(seed_param) if int(seed_param) >= 0 else np.random.randint(0, 2**32 - 1)
 
@@ -528,7 +703,7 @@ def exact_replace_video_background(video_state, ref_image_input, ref_mask, video
                     processing_status["inpainting"] = False
                 return
 
-            # Create 3-channel version for later CogVideoX processing
+            # Create 3-channel version for AnyDoor target-mask use. It may be replaced before CogVideoX.
             validation_masks_3ch = [np.stack([m, m, m], axis=-1) for m in validation_masks]
 
             # AnyDoor generates the first frame with the reference object
@@ -571,6 +746,25 @@ def exact_replace_video_background(video_state, ref_image_input, ref_mask, video
             os.makedirs(os.path.join(GRADIO_TEMP_DIR, "inpaint"), exist_ok=True)
             Image.fromarray(validation_images[0]).save(os.path.join(GRADIO_TEMP_DIR, "inpaint", "first_frame_anydoor.png"))
 
+            try:
+                object_mask = segment_anydoor_object_mask_for_ui(Image.fromarray(validation_images[0]).convert('RGB'), target_region_caption)
+                propagation_mask_source = "anydoor_object"
+            except Exception as exc:
+                print(f"AnyDoor object mask segmentation failed; using fitted reference mask fallback: {exc}")
+                object_mask = fit_reference_mask_to_target_bbox(ref_mask_arr, tar_mask_arr, output_size=(720, 480))
+                propagation_mask_source = "fitted_reference_mask"
+
+            Image.fromarray((np.asarray(object_mask) > 0).astype(np.uint8) * 255).convert('L').save(
+                os.path.join(GRADIO_TEMP_DIR, "inpaint", "anydoor_object_first_mask.png")
+            )
+            tracked_masks = fit_object_mask_to_video_motion(object_mask, validation_masks)
+            propagation_mask_source = f"{propagation_mask_source}_fit_to_video_motion"
+            Image.fromarray((tracked_masks[0].squeeze() * 255).astype(np.uint8)).save(
+                os.path.join(GRADIO_TEMP_DIR, "inpaint", "propagation_first_mask.png")
+            )
+            validation_masks_3ch = [np.stack([m.squeeze() * 255, m.squeeze() * 255, m.squeeze() * 255], axis=-1).astype(np.uint8) for m in tracked_masks]
+            print(f"Using {propagation_mask_source} mask for CogVideoX propagation")
+
             # Now convert all frames to PIL
             validation_images = [Image.fromarray(np.uint8(img)).convert('RGB') for img in validation_images]
             validation_masks_pil = [Image.fromarray(np.uint8(mask)).convert('RGB') for mask in validation_masks_3ch]
@@ -578,18 +772,50 @@ def exact_replace_video_background(video_state, ref_image_input, ref_mask, video
             validation_images = [img.resize((720, 480)) for img in validation_images]
             validation_masks_pil = [mask.resize((720, 480)) for mask in validation_masks_pil]
 
-            print(f"Using video's first frame mask for consistency")
+            print(f"Using {propagation_mask_source} first frame mask for propagation")
             first_mask = np.array(validation_masks_pil[0])
             print(f"First mask after resize - pixel sum: {np.sum(first_mask)}")
 
+            reference_motion_guide = reference_motion_guide or "none"
+            guide_images = None
+            guide_mode = "none"
+            generation_masks_pil = validation_masks_pil
+            anydoor_first_frame_pil = validation_images[0]
+            tracked_mask_arrays = [(mask.squeeze() * 255).astype(np.uint8) for mask in tracked_masks]
+            target_bboxes = build_target_bboxes_for_guides_ui(
+                tracked_mask_arrays,
+                smoothing_mode=mask_bbox_smoothing or "off",
+                smoothing_window=int(mask_bbox_smoothing_window),
+                max_scale_delta=float(mask_bbox_max_scale_delta),
+                output_size=(720, 480),
+            )
+            if save_mask_bbox_stats:
+                save_mask_bbox_diagnostics_ui(os.path.join(GRADIO_TEMP_DIR, "inpaint", "mask_bbox_stats.json"), tracked_mask_arrays, target_bboxes)
+            if reference_motion_guide in {"full_region", "edge_refine"}:
+                guide_images = composite_object_guide_frames(
+                    validation_images,
+                    anydoor_first_frame_pil.resize((720, 480)),
+                    (np.asarray(object_mask) > 0).astype(np.uint8) * 255,
+                    tracked_mask_arrays,
+                    target_bboxes=target_bboxes,
+                )
+                guide_mode = reference_motion_guide
+                guide_images[0].save(os.path.join(GRADIO_TEMP_DIR, "inpaint", "guide_frame_000.png"))
+                guide_images[min(1, len(guide_images) - 1)].save(os.path.join(GRADIO_TEMP_DIR, "inpaint", "guide_frame_001.png"))
+                if reference_motion_guide == "edge_refine":
+                    generation_masks_pil = build_edge_refine_masks(tracked_mask_arrays)
+                    generation_masks_pil[0].save(os.path.join(GRADIO_TEMP_DIR, "inpaint", "guide_edge_first_mask.png"))
+                print(f"Using reference motion guide mode: {guide_mode}")
+
+            effective_video_caption = build_reference_propagation_prompt(video_caption, target_region_caption)
             print(f"Video caption: {video_caption}")
+            print(f"Target region caption: {target_region_caption}")
+            print(f"Effective video caption: {effective_video_caption}")
 
             # VideoPainter propagation
             with processing_lock:
                 processing_status["inpainting_message"] = "Stage 2/3: Running CogVideoX propagation (1-2 min)..."
             print("Stage 2/3: Propagating with CogVideoX...")
-
-            anydoor_first_frame_pil = validation_images[0]
 
             def progress_callback(step, total, message):
                 """Receive progress updates."""
@@ -599,21 +825,26 @@ def exact_replace_video_background(video_state, ref_image_input, ref_mask, video
 
             images = generate_frames(
                 images=validation_images,
-                masks=validation_masks_pil,
+                masks=generation_masks_pil,
                 pipe=validation_pipeline,
                 pipe_img_inpainting=validation_pipeline_img,
-                prompt=str(video_caption),
+                prompt=str(effective_video_caption),
                 image_inpainting_prompt="",
                 seed=seed,
                 cfg_scale=float(cfg_scale),
                 dilate_size=int(dilate_size),
                 first_frame_override=anydoor_first_frame_pil,
                 progress_callback=progress_callback,
+                return_full_sequence=True,
+                prev_clip_weight=REFERENCE_PREV_CLIP_WEIGHT,
+                id_pool_resample_learnable=True,
+                guide_images=guide_images,
+                guide_mode=guide_mode,
+                guide_dilate_size=int(guide_dilate_size),
             )
 
             print("Stage 2/3: CogVideoX propagation complete!")
-            images = (images * 255).astype(np.uint8)
-
+            images = finalize_propagation_sequence(images, fallback_first_frame=anydoor_first_frame_pil.resize((720, 480)))
             # Trim output to original frame count
             original_count = video_state.get("original_frame_count", len(images))
             if len(images) > original_count:
@@ -845,6 +1076,16 @@ def main():
 
             # Middle Column - Reference Image
             with gr.Column(scale=1):
+                with gr.Accordion("Sketch to Reference", open=False):
+                    sketch_image_input = gr.Image(label="Upload Sketch", type="numpy")
+                    sketch_label_input = gr.Textbox(label="Object Label", placeholder="Required, e.g. apple")
+                    sketch_attrs_input = gr.Textbox(label="Optional Attributes", placeholder="e.g. red, glossy")
+                    sketch_candidate_count = gr.Slider(label="Candidate Count", minimum=1, maximum=8, step=1, value=2)
+                    reference_num_inference_steps = gr.Slider(label="Reference Steps", minimum=20, maximum=80, step=1, value=40)
+                    reference_guidance_scale = gr.Slider(label="Reference Guidance Scale", minimum=3.0, maximum=12.0, step=0.1, value=6.5)
+                    reference_controlnet_scale = gr.Slider(label="Reference ControlNet Scale", minimum=0.2, maximum=1.2, step=0.05, value=0.7)
+                    sketch_generate_btn = gr.Button("Generate Reference From Sketch", variant="secondary")
+
                 gr.Markdown("### 🖼️ Reference Image (for Exact Replacement)")
                 ref_image_input = gr.Image(label="Upload Reference Image", type="numpy")
                 ref_template = gr.Image(label="Segmented Reference", interactive=False, type="numpy")
@@ -865,6 +1106,18 @@ def main():
                     step=0.5,
                     value=5.0
                 )
+
+                reference_motion_guide = gr.Radio(
+                    choices=["none", "full_region", "edge_refine"],
+                    value="none",
+                    label="Reference Motion Guide",
+                    info="Experimental. Use edge_refine for cross-shape objects after checking guide frames.",
+                )
+                guide_dilate_size = gr.Slider(label="Guide Dilate Size", minimum=0, maximum=32, step=1, value=4)
+                mask_bbox_smoothing = gr.Radio(choices=["off", "median"], value="off", label="Mask Bbox Smoothing")
+                mask_bbox_smoothing_window = gr.Slider(label="Mask Bbox Smoothing Window", minimum=1, maximum=15, step=2, value=5)
+                mask_bbox_max_scale_delta = gr.Slider(label="Mask Bbox Max Scale Delta", minimum=0.0, maximum=0.3, step=0.01, value=0.08)
+                save_mask_bbox_stats = gr.Checkbox(label="Save Mask Bbox Stats", value=False)
 
             # Right Column - Settings & Output
             with gr.Column(scale=1):
@@ -963,6 +1216,12 @@ def main():
             outputs=[tracked_video_output, tracking_progress, run_status],
         )
 
+        sketch_generate_btn.click(
+            fn=generate_reference_from_sketch,
+            inputs=[sketch_image_input, video_state, sketch_label_input, sketch_attrs_input, sketch_candidate_count, reference_num_inference_steps, reference_guidance_scale, reference_controlnet_scale, seed_param, run_status],
+            outputs=[ref_image_input, ref_template, ref_click_state, ref_mask_state, run_status],
+        )
+
         ref_image_input.select(
             fn=semantic_segment_reference,
             inputs=[ref_image_input, ref_point_prompt, ref_click_state],
@@ -983,7 +1242,7 @@ def main():
 
         exact_replace_btn.click(
             fn=exact_replace_video_background,
-            inputs=[video_state, ref_image_input, ref_mask_state, video_caption, run_status, seed_param, cfg_scale, dilate_size, anydoor_guidance_scale],
+            inputs=[video_state, ref_image_input, ref_mask_state, video_caption, target_region_caption, run_status, seed_param, cfg_scale, dilate_size, anydoor_guidance_scale, reference_motion_guide, guide_dilate_size, mask_bbox_smoothing, mask_bbox_smoothing_window, mask_bbox_max_scale_delta, save_mask_bbox_stats],
             outputs=[video_output, inpaint_progress, run_status],
         )
 
