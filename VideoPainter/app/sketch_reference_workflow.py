@@ -60,6 +60,46 @@ def build_reference_preview(image, mask):
 
 
 
+def _mask_bbox(mask_arr: np.ndarray):
+    binary = mask_arr > 0
+    ys, xs = np.where(binary)
+    if len(xs) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def fit_reference_to_frame_mask(reference_image: Image.Image, reference_mask, target_mask, output_size=(720, 480)):
+    image_arr = np.asarray(reference_image.convert("RGB"), dtype=np.uint8)
+    ref = np.asarray(reference_mask, dtype=np.uint8)
+    if ref.ndim == 3:
+        ref = ref[..., 0]
+    ref = (ref > 0).astype(np.uint8) * 255
+    target = np.asarray(target_mask, dtype=np.uint8)
+    if target.ndim == 3:
+        target = target[..., 0]
+    target = (target > 0).astype(np.uint8) * 255
+
+    ref_bbox = _mask_bbox(ref)
+    target_bbox = _mask_bbox(target)
+    if ref_bbox is None or target_bbox is None:
+        raise ValueError("reference_mask and target_mask must be non-empty")
+
+    rx0, ry0, rx1, ry1 = ref_bbox
+    tx0, ty0, tx1, ty1 = target_bbox
+    object_crop = image_arr[ry0 : ry1 + 1, rx0 : rx1 + 1]
+    alpha_crop = ref[ry0 : ry1 + 1, rx0 : rx1 + 1]
+    target_w = tx1 - tx0 + 1
+    target_h = ty1 - ty0 + 1
+    resized_rgb = np.asarray(Image.fromarray(object_crop).resize((target_w, target_h), Image.BICUBIC), dtype=np.uint8)
+    resized_alpha = np.asarray(Image.fromarray(alpha_crop).resize((target_w, target_h), Image.NEAREST), dtype=np.uint8)
+
+    canvas = np.full((output_size[1], output_size[0], 3), 255, dtype=np.uint8)
+    alpha = (resized_alpha > 0).astype(np.float32)[:, :, None]
+    patch = canvas[ty0 : ty1 + 1, tx0 : tx1 + 1]
+    patch[:] = np.clip(alpha * resized_rgb.astype(np.float32) + (1.0 - alpha) * patch.astype(np.float32), 0, 255).astype(np.uint8)
+    return Image.fromarray(canvas).convert("RGB"), Image.fromarray(target).convert("L")
+
+
 def score_shape_compatibility(candidate_mask, target_mask):
     candidate = mask_geometry(candidate_mask)
     target = mask_geometry(target_mask)
@@ -140,6 +180,10 @@ def generate_reference_assets(
     reference_num_inference_steps: int = 40,
     reference_guidance_scale: float = 6.5,
     reference_controlnet_scale: float = 0.7,
+    shape_conditioned_scribble: bool = False,
+    sketch_mask_fit_strength: float = 0.5,
+    mask_contour_weight: float = 0.6,
+    frame_shaped_reference: bool = False,
 ) -> dict[str, Any]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -161,6 +205,10 @@ def generate_reference_assets(
         num_inference_steps=reference_num_inference_steps,
         guidance_scale=reference_guidance_scale,
         controlnet_conditioning_scale=reference_controlnet_scale,
+        target_mask_for_shape=target_mask_for_shape,
+        shape_conditioned_scribble=shape_conditioned_scribble,
+        sketch_mask_fit_strength=sketch_mask_fit_strength,
+        mask_contour_weight=mask_contour_weight,
     )
 
     image_predictor = build_sam2_image_predictor(sam2_cfg, str(sam2_ckpt), device=device)
@@ -178,6 +226,11 @@ def generate_reference_assets(
             "image_path": str(image_path),
             "status": "failed",
         }
+        scribble = candidate.get("scribble")
+        if scribble is not None:
+            scribble_path = candidates_dir / f"candidate_{idx:02d}_scribble.png"
+            scribble.save(scribble_path)
+            record["scribble_path"] = str(scribble_path)
         try:
             score = _segment_candidate(
                 candidate["image"],
@@ -245,6 +298,10 @@ def generate_reference_assets(
             "reference_num_inference_steps": int(reference_num_inference_steps),
             "reference_guidance_scale": float(reference_guidance_scale),
             "reference_controlnet_scale": float(reference_controlnet_scale),
+            "shape_conditioned_scribble": bool(shape_conditioned_scribble),
+            "sketch_mask_fit_strength": float(sketch_mask_fit_strength),
+            "mask_contour_weight": float(mask_contour_weight),
+            "frame_shaped_reference": bool(frame_shaped_reference),
             "cache_dir": str(cache_dir),
             "best_candidate_index": None,
             "reference_image": str(reference_image_path),
@@ -265,8 +322,23 @@ def generate_reference_assets(
         }
 
     best = select_best_reference_candidate(scored_candidates)
-    best["image"].save(reference_image_path)
-    Image.fromarray(best["mask"]).convert("L").save(reference_mask_path)
+    best_image = best["image"]
+    best_mask = best["mask"]
+    if frame_shaped_reference:
+        if target_mask_for_shape is None:
+            raise ValueError("frame_shaped_reference requires target_mask_for_shape")
+        best_image, best_mask_pil = fit_reference_to_frame_mask(
+            best_image,
+            best_mask,
+            target_mask_for_shape,
+            output_size=(720, 480),
+        )
+        best_mask = np.asarray(best_mask_pil.convert("L"), dtype=np.uint8)
+        best["image"] = best_image.copy()
+        best["mask"] = best_mask
+
+    best_image.save(reference_image_path)
+    Image.fromarray(best_mask).convert("L").save(reference_mask_path)
 
     meta = {
         "label": label,
@@ -278,6 +350,10 @@ def generate_reference_assets(
         "reference_num_inference_steps": int(reference_num_inference_steps),
         "reference_guidance_scale": float(reference_guidance_scale),
         "reference_controlnet_scale": float(reference_controlnet_scale),
+        "shape_conditioned_scribble": bool(shape_conditioned_scribble),
+        "sketch_mask_fit_strength": float(sketch_mask_fit_strength),
+        "mask_contour_weight": float(mask_contour_weight),
+        "frame_shaped_reference": bool(frame_shaped_reference),
         "cache_dir": str(cache_dir),
         "best_candidate_index": int(best["index"]),
         "reference_image": str(reference_image_path),

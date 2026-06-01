@@ -228,6 +228,20 @@ def composite_object_guide_frames(frames, object_image, object_mask, target_mask
         guides.append(Image.fromarray(frame_arr).convert("RGB"))
     return guides
 
+
+def build_union_edit_masks(target_masks, object_masks):
+    if len(target_masks) != len(object_masks):
+        raise ValueError("target_masks and object_masks must have the same length")
+
+    union_masks = []
+    for target_mask, object_mask in zip(target_masks, object_masks):
+        target = _to_mask_array(target_mask) > 0
+        obj = _to_mask_array(object_mask) > 0
+        union = np.logical_or(target, obj).astype(np.uint8) * 255
+        union_rgb = np.stack([union, union, union], axis=-1)
+        union_masks.append(Image.fromarray(union_rgb).convert("RGB"))
+    return union_masks
+
 def build_edge_refine_masks(target_masks, inner_erode_iter=4, outer_dilate_iter=8):
     edge_masks = []
     for mask in target_masks:

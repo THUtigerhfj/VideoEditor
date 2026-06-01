@@ -24,7 +24,7 @@ os.chdir(APP)
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from anydoor_bridge import replace_first_frame_with_anydoor  # noqa: E402
-from frame_conditioning import build_edge_refine_masks, composite_object_guide_frames, finalize_propagation_sequence, mask_bbox, mask_bbox_trajectory, smooth_mask_bboxes  # noqa: E402
+from frame_conditioning import build_edge_refine_masks, build_union_edit_masks, composite_object_guide_frames, finalize_propagation_sequence, mask_bbox, mask_bbox_trajectory, smooth_mask_bboxes  # noqa: E402
 from reference_segmenter import clean_binary_mask, detect_object_box_with_grounding_dino, segment_box_with_sam2  # noqa: E402
 from sam2.build_sam import build_sam2, build_sam2_video_predictor  # noqa: E402
 from sam2.sam2_image_predictor import SAM2ImagePredictor  # noqa: E402
@@ -414,17 +414,30 @@ def run_reference_replacement(args, dirs, frames, masks, pil_frames, pil_masks, 
     metadata["reference_propagation_mask_source"] = propagation_mask_source
     reference_motion_guide = getattr(args, "reference_motion_guide", "none")
     metadata["reference_motion_guide"] = reference_motion_guide
+    metadata["conditioning_video_mode"] = getattr(args, "conditioning_video_mode", "full_video")
     metadata["guide_edge_inner_erode"] = getattr(args, "guide_edge_inner_erode", 4)
     metadata["guide_edge_outer_dilate"] = getattr(args, "guide_edge_outer_dilate", 8)
     metadata["mask_bbox_smoothing"] = getattr(args, "mask_bbox_smoothing", "off")
     metadata["mask_bbox_smoothing_window"] = getattr(args, "mask_bbox_smoothing_window", 5)
     metadata["mask_bbox_max_scale_delta"] = getattr(args, "mask_bbox_max_scale_delta", 0.08)
+    metadata["edit_mask_mode"] = getattr(args, "edit_mask_mode", "propagation")
+    metadata["effective_edit_mask_mode"] = metadata["edit_mask_mode"]
     pil_frames, pil_masks = pil_frames_and_masks(frames, propagation_masks)
 
     guide_images = None
     guide_mode = "none"
-    generation_masks = pil_masks
-    propagation_mask_arrays = [(mask.squeeze() * 255).astype(np.uint8) for mask in propagation_masks]
+    original_target_mask_arrays = [((mask.squeeze() > 0).astype(np.uint8) * 255) for mask in masks]
+    propagation_mask_arrays = [((mask.squeeze() > 0).astype(np.uint8) * 255) for mask in propagation_masks]
+    if metadata["edit_mask_mode"] == "union_target_object":
+        generation_masks = build_union_edit_masks(original_target_mask_arrays, propagation_mask_arrays)
+        generation_mask_arrays = [np.asarray(mask.convert("L"), dtype=np.uint8) for mask in generation_masks]
+        Image.fromarray(generation_mask_arrays[0]).save(dirs["masks"] / "edit_first_mask.png")
+        edit_overlay_masks = np.asarray([(arr > 0).astype(np.uint8)[:, :, None] for arr in generation_mask_arrays])
+        save_mask_overlay(frames, edit_overlay_masks, dirs["overlays"] / "edit_mask_overlay.mp4")
+    else:
+        generation_masks = pil_masks
+        generation_mask_arrays = propagation_mask_arrays
+        Image.fromarray(generation_mask_arrays[0]).save(dirs["masks"] / "edit_first_mask.png")
     target_bboxes = build_target_bboxes_for_guides(propagation_mask_arrays, args, output_size=(720, 480))
     if getattr(args, "save_mask_bbox_stats", False):
         save_mask_bbox_diagnostics(dirs["root"] / "mask_bbox_stats.json", propagation_mask_arrays, target_bboxes)
@@ -448,6 +461,7 @@ def run_reference_replacement(args, dirs, frames, masks, pil_frames, pil_masks, 
                 outer_dilate_iter=getattr(args, "guide_edge_outer_dilate", 8),
             )
             generation_masks[0].save(dirs["masks"] / "guide_edge_first_mask.png")
+            metadata["effective_edit_mask_mode"] = "edge_refine"
 
     pipe, _ = load_model(
         model_path=args.model_path,
@@ -473,6 +487,7 @@ def run_reference_replacement(args, dirs, frames, masks, pil_frames, pil_masks, 
         guide_images=[img.copy() for img in guide_images] if guide_images is not None else None,
         guide_mode=guide_mode,
         guide_dilate_size=getattr(args, "guide_dilate_size", None),
+        conditioning_video_mode=getattr(args, "conditioning_video_mode", "full_video"),
     )
     propagated_uint8 = finalize_propagation_sequence(propagated, fallback_first_frame=replaced_first.resize((720, 480)))
     propagated_first = Image.fromarray(propagated_uint8[0]).convert("RGB")
@@ -560,6 +575,10 @@ def run(args):
                 reference_num_inference_steps=args.reference_num_inference_steps,
                 reference_guidance_scale=args.reference_guidance_scale,
                 reference_controlnet_scale=args.reference_controlnet_scale,
+                shape_conditioned_scribble=args.shape_conditioned_scribble,
+                sketch_mask_fit_strength=args.sketch_mask_fit_strength,
+                mask_contour_weight=args.mask_contour_weight,
+                frame_shaped_reference=args.frame_shaped_reference,
             )
             metadata["reference_meta"] = sketch_result["metadata"]
             reference_image = Image.open(sketch_result["reference_image_path"]).convert("RGB")
@@ -600,6 +619,10 @@ def build_parser():
     parser.add_argument("--reference_guidance_scale", type=float, default=6.5, help="SDXL text guidance scale for sketch-to-reference generation.")
     parser.add_argument("--reference_controlnet_scale", type=float, default=0.7, help="ControlNet scribble conditioning scale; lower values such as 0.45-0.6 can reduce line-art artifacts.")
     parser.add_argument("--shape_compatibility_weight", type=float, default=0.25, help="Extra sketch candidate score weight for matching the clicked video target mask shape. Use 0 to disable.")
+    parser.add_argument("--shape_conditioned_scribble", action="store_true", help="Add the video frame0 target mask contour to the sketch ControlNet input.")
+    parser.add_argument("--sketch_mask_fit_strength", type=float, default=0.5, help="Reserved strength for fitting sketch control to frame0 mask shape.")
+    parser.add_argument("--mask_contour_weight", type=float, default=0.6, help="Weight/enable value for frame0 mask contour in shape-conditioned scribble.")
+    parser.add_argument("--frame_shaped_reference", action="store_true", help="Fit selected reference object into the original 720x480 frame0 target mask and use that mask as reference_mask.")
     parser.add_argument(
         "--video_caption",
         required=True,
@@ -617,6 +640,17 @@ def build_parser():
     parser.add_argument("--reference_prev_clip_weight", type=float, default=REFERENCE_PREV_CLIP_WEIGHT, help="Identity-preserving previous-clip weight for image_reference and sketch_reference propagation.")
     parser.add_argument("--reference_propagation_mask_source", choices=["anydoor_object", "anydoor_object_sam2", "video_target"], default="anydoor_object", help="Mask source for image_reference/sketch_reference propagation. anydoor_object re-segments the AnyDoor first frame and fits that object shape to the original video mask motion; anydoor_object_sam2 tracks the object mask with SAM2; video_target keeps the original clicked video mask.")
     parser.add_argument("--reference_motion_guide", choices=["none", "full_region", "edge_refine"], default="none", help="Experimental guide mode for reference replacement. none keeps masked-video conditioning; full_region composites the reference object into conditioning frames; edge_refine composites the object and asks VideoPainter to refine boundary masks.")
+    parser.add_argument("--conditioning_video_mode", choices=["masked_video", "full_video"], default="full_video", help="Conditioning video mode for reference replacement. full_video keeps original pixels visible like the initial reference pipeline while still passing masks separately; masked_video blacks out edit regions before CogVideoX and is kept for debugging/backward comparisons.")
+    parser.add_argument(
+        "--edit_mask_mode",
+        choices=["propagation", "union_target_object"],
+        default="propagation",
+        help=(
+            "Mask passed to CogVideoX for reference replacement. propagation keeps the current "
+            "replacement propagation mask; union_target_object edits the union of the original "
+            "clicked video target mask and the propagated replacement object mask."
+        ),
+    )
     parser.add_argument("--guide_edge_inner_erode", type=int, default=4)
     parser.add_argument("--guide_edge_outer_dilate", type=int, default=8)
     parser.add_argument("--guide_dilate_size", type=int, default=4, help="Mask dilation size used when reference_motion_guide=edge_refine.")

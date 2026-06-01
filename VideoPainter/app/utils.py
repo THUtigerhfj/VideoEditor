@@ -131,6 +131,7 @@ def generate_frames(
         guide_images=None,
         guide_mode="none",
         guide_dilate_size=None,
+        conditioning_video_mode="masked_video",
     ):
     """
     Generate inpainted video frames.
@@ -251,9 +252,15 @@ def generate_frames(
             raise ValueError(f"guide_images must have {len(images)} frames, got {len(guide_images)}")
         conditioning_images = [img.resize(images[0].size).convert("RGB") for img in guide_images]
         conditioning_images[0] = images[0].copy()
+    if conditioning_video_mode not in {"masked_video", "full_video"}:
+        raise ValueError(f"Unsupported conditioning_video_mode: {conditioning_video_mode}")
     if guide_images is not None and guide_mode != "none":
         # Guide frames already carry the replacement object's color/identity.
         # Keep those pixels visible; masks are still passed separately to the video model.
+        masked_video = [img.copy() for img in conditioning_images]
+    elif conditioning_video_mode == "full_video":
+        # Debug/compatibility mode matching the initial reference pipeline: keep original
+        # video pixels visible and let the separate mask tensor define edit regions.
         masked_video = [img.copy() for img in conditioning_images]
     else:
         masked_video = build_masked_video_frames(conditioning_images, conditioning_masks, mask_background=False)

@@ -180,6 +180,65 @@ def preprocess_sketch_for_scribble(sketch: Image.Image, size: int = 1024) -> Ima
     return Image.fromarray(canvas)
 
 
+def _mask_bbox(mask_arr: np.ndarray):
+    binary = mask_arr > 0
+    ys, xs = np.where(binary)
+    if len(xs) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def build_mask_shape_scribble(target_mask, size: int = 1024, contour_width: int = 5) -> Image.Image:
+    if size <= 0:
+        raise ValueError("size must be positive")
+    mask = np.asarray(target_mask, dtype=np.uint8)
+    if mask.ndim == 3:
+        mask = mask[..., 0]
+    mask = (mask > 0).astype(np.uint8) * 255
+    bbox = _mask_bbox(mask)
+    canvas = np.full((size, size), 255, dtype=np.uint8)
+    if bbox is None:
+        return Image.fromarray(np.stack([canvas, canvas, canvas], axis=-1)).convert("RGB")
+
+    x0, y0, x1, y1 = bbox
+    crop = mask[y0 : y1 + 1, x0 : x1 + 1]
+    target_side = max(1, int(size * 0.78))
+    scale = min(target_side / max(crop.shape[1], 1), target_side / max(crop.shape[0], 1))
+    new_w = max(1, int(round(crop.shape[1] * scale)))
+    new_h = max(1, int(round(crop.shape[0] * scale)))
+    resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+    contour = np.zeros_like(resized)
+    contours, _ = cv2.findContours((resized > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(contour, contours, -1, 255, max(1, int(contour_width)))
+    y = (size - new_h) // 2
+    x = (size - new_w) // 2
+    canvas[y : y + new_h, x : x + new_w] = np.where(contour > 0, 0, canvas[y : y + new_h, x : x + new_w])
+    return Image.fromarray(np.stack([canvas, canvas, canvas], axis=-1)).convert("RGB")
+
+
+def build_shape_conditioned_scribble(
+    sketch: Image.Image,
+    target_mask,
+    size: int = 1024,
+    sketch_mask_fit_strength: float = 0.5,
+    mask_contour_weight: float = 0.6,
+) -> Image.Image:
+    sketch_scribble = preprocess_sketch_for_scribble(sketch, size=size).convert("L")
+    if target_mask is None or mask_contour_weight <= 0:
+        return Image.merge("RGB", (sketch_scribble, sketch_scribble, sketch_scribble))
+
+    mask_scribble = build_mask_shape_scribble(target_mask, size=size).convert("L")
+    sketch_arr = np.asarray(sketch_scribble, dtype=np.uint8)
+    mask_arr = np.asarray(mask_scribble, dtype=np.uint8)
+    sketch_lines = sketch_arr < 128
+    mask_lines = mask_arr < 128
+
+    # Keep user sketch semantics, then add target contour as spatial guidance.
+    combined = np.full((size, size), 255, dtype=np.uint8)
+    combined[np.logical_or(sketch_lines, mask_lines)] = 0
+    return Image.fromarray(np.stack([combined, combined, combined], axis=-1)).convert("RGB")
+
+
 @lru_cache(maxsize=2)
 def build_sdxl_scribble_pipeline(cache_dir: str, device: str = "cuda"):
     import torch
@@ -219,13 +278,26 @@ def generate_reference_candidates(
     guidance_scale: float = 6.5,
     controlnet_conditioning_scale: float = 0.7,
     size: int = 1024,
+    target_mask_for_shape=None,
+    shape_conditioned_scribble: bool = False,
+    sketch_mask_fit_strength: float = 0.5,
+    mask_contour_weight: float = 0.6,
 ):
     import torch
 
     if num_candidates <= 0:
         raise ValueError("num_candidates must be positive")
     prompt, negative_prompt = build_reference_prompt(label, attrs)
-    scribble = preprocess_sketch_for_scribble(sketch, size=size)
+    if shape_conditioned_scribble and target_mask_for_shape is not None:
+        scribble = build_shape_conditioned_scribble(
+            sketch,
+            target_mask=target_mask_for_shape,
+            size=size,
+            sketch_mask_fit_strength=sketch_mask_fit_strength,
+            mask_contour_weight=mask_contour_weight,
+        )
+    else:
+        scribble = preprocess_sketch_for_scribble(sketch, size=size)
     seeds = list(seeds or range(42, 42 + num_candidates))[:num_candidates]
     candidates = []
     for seed in seeds:
