@@ -16,3 +16,14 @@ Noticies:
 TODO:
 * Support sketching. This is straightforward by treating the output of sketching as the input (reference image) of the current implementation.
 * [Optional] Use flux.2 for better quality.
+
+### Gradio sketch reference workflow
+
+Because the bundled Gradio version has a short frontend timeout, sketch-to-reference generation also runs in the background, like tracking and inpainting.
+
+Use it as follows:
+
+1. Upload a sketch and fill Object Label / Optional Attributes.
+2. Click `Generate Reference From Sketch`.
+3. Wait and click `Check Sketch Status` to inspect progress.
+4. Click `Load Sketch Result` after it completes. This fills the Reference Image, Segmented Reference preview, and reference mask state.

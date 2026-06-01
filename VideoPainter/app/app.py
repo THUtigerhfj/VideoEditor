@@ -96,16 +96,20 @@ args = parser.parse_args()
 # =============================================================================
 latest_tracking_video = None
 latest_inpaint_video = None
+latest_sketch_reference = None
 
 # Processing state for background jobs
 processing_lock = threading.Lock()
 processing_status = {
     "tracking": False,
     "inpainting": False,
+    "sketch_reference": False,
     "tracking_message": "",
     "inpainting_message": "",
+    "sketch_reference_message": "",
     "tracking_error": "",
-    "inpainting_error": ""
+    "inpainting_error": "",
+    "sketch_reference_error": ""
 }
 
 
@@ -492,62 +496,91 @@ def semantic_segment_reference(ref_image, point_prompt, click_state, evt: gr.Sel
 
 
 def generate_reference_from_sketch(sketch_image, video_state, label, attrs, candidate_count, reference_num_inference_steps, reference_guidance_scale, reference_controlnet_scale, seed_param, previous_status):
-    """Generate a reference image/mask pair from sketch input and reuse current reference UI state."""
+    """Start sketch-to-reference generation in a background thread.
+
+    README notes that this Gradio version has a short request timeout, so heavy
+    tasks must return immediately and be retrieved with explicit load buttons.
+    """
+    global latest_sketch_reference
     if sketch_image is None:
-        return None, None, [[], []], None, update_status(previous_status, "Please upload a sketch first.", StatusMessage.ERROR)
+        return "", update_status(previous_status, "Please upload a sketch first.", StatusMessage.ERROR)
 
     clean_label = str(label).strip()
     if not clean_label:
-        return None, None, [[], []], None, update_status(previous_status, "Object label is required for sketch mode.", StatusMessage.ERROR)
+        return "", update_status(previous_status, "Object label is required for sketch mode.", StatusMessage.ERROR)
+
+    with processing_lock:
+        if processing_status["sketch_reference"]:
+            return "⚠️ Already generating a sketch reference. Please wait.", update_status(previous_status, "Sketch reference generation already running.", StatusMessage.WARNING)
+        processing_status["sketch_reference"] = True
+        processing_status["sketch_reference_message"] = "Starting..."
+        processing_status["sketch_reference_error"] = ""
+        latest_sketch_reference = None
+
+    sketch_image_copy = np.asarray(sketch_image, dtype=np.uint8).copy()
+    target_mask_for_shape = None
+    if video_state is not None and video_state.get("masks") is not None and len(video_state["masks"]) > 0:
+        target_mask_for_shape = (np.squeeze(video_state["masks"][0]) > 0).astype(np.uint8) * 255
 
     seed = int(seed_param) if int(seed_param) >= 0 else -1
     run_dir = os.path.join(GRADIO_TEMP_DIR, "sketch_ref", str(int(time.time() * 1000)))
     os.makedirs(run_dir, exist_ok=True)
 
-    try:
-        sketch_pil = Image.fromarray(np.asarray(sketch_image, dtype=np.uint8)).convert("RGB")
-        target_mask_for_shape = None
-        if video_state is not None and video_state.get("masks") is not None and len(video_state["masks"]) > 0:
-            target_mask_for_shape = (np.squeeze(video_state["masks"][0]) > 0).astype(np.uint8) * 255
-        result = generate_reference_assets(
-            sketch_image=sketch_pil,
-            label=clean_label,
-            attrs=attrs,
-            output_dir=run_dir,
-            cache_dir=SKETCH_REF_CACHE_DIR,
-            sam2_cfg="sam2_hiera_l.yaml",
-            sam2_ckpt=args.sam2_checkpoint,
-            device="cuda",
-            candidate_count=int(candidate_count),
-            seed=seed,
-            reference_num_inference_steps=int(reference_num_inference_steps),
-            reference_guidance_scale=float(reference_guidance_scale),
-            reference_controlnet_scale=float(reference_controlnet_scale),
-            allow_missing_mask=True,
-            target_mask_for_shape=target_mask_for_shape,
-            shape_compatibility_weight=0.25,
-        )
-        ref_image, ref_mask = load_reference_assets_for_ui(
-            result["reference_image_path"],
-            result["reference_mask_path"],
-        )
-        preview = build_reference_preview(ref_image, ref_mask)
-        if ref_mask is None:
-            status = update_status(
-                previous_status,
-                "Reference image generated, but auto segmentation failed. Click the reference image to create the mask manually.",
-                StatusMessage.WARNING,
+    def generate_in_background():
+        global latest_sketch_reference
+        try:
+            with processing_lock:
+                processing_status["sketch_reference_message"] = "Loading SDXL scribble ControlNet from local cache..."
+            print("Stage sketch-reference: loading/generating reference from sketch...")
+            sketch_pil = Image.fromarray(sketch_image_copy).convert("RGB")
+            with processing_lock:
+                processing_status["sketch_reference_message"] = "Generating reference candidates..."
+            result = generate_reference_assets(
+                sketch_image=sketch_pil,
+                label=clean_label,
+                attrs=attrs,
+                output_dir=run_dir,
+                cache_dir=SKETCH_REF_CACHE_DIR,
+                sam2_cfg="sam2_hiera_l.yaml",
+                sam2_ckpt=args.sam2_checkpoint,
+                device="cuda",
+                candidate_count=int(candidate_count),
+                seed=seed,
+                reference_num_inference_steps=int(reference_num_inference_steps),
+                reference_guidance_scale=float(reference_guidance_scale),
+                reference_controlnet_scale=float(reference_controlnet_scale),
+                allow_missing_mask=True,
+                target_mask_for_shape=target_mask_for_shape,
+                shape_compatibility_weight=0.25,
             )
-        else:
-            status = update_status(
-                previous_status,
-                "Reference image and mask generated from sketch. You can still click the reference image to refine the mask.",
-                StatusMessage.SUCCESS,
+            with processing_lock:
+                processing_status["sketch_reference_message"] = "Loading generated reference assets..."
+            ref_image, ref_mask = load_reference_assets_for_ui(
+                result["reference_image_path"],
+                result["reference_mask_path"],
             )
-        return ref_image, preview, [[], []], ref_mask, status
-    except Exception as exc:
-        return None, None, [[], []], None, update_status(previous_status, f"Sketch generation failed: {exc}", StatusMessage.ERROR)
+            preview = build_reference_preview(ref_image, ref_mask)
+            latest_sketch_reference = {
+                "ref_image": ref_image,
+                "preview": preview,
+                "ref_mask": ref_mask,
+                "run_dir": run_dir,
+                "metadata": result.get("metadata", {}),
+            }
+            with processing_lock:
+                processing_status["sketch_reference_message"] = "Complete!"
+                processing_status["sketch_reference"] = False
+            print(f"Sketch reference saved under: {run_dir}")
+        except Exception as exc:
+            import traceback
+            print(f"Sketch reference error: {traceback.format_exc()}")
+            with processing_lock:
+                processing_status["sketch_reference_error"] = str(exc)
+                processing_status["sketch_reference"] = False
 
+    thread = threading.Thread(target=generate_in_background, daemon=True)
+    thread.start()
+    return "🚀 Sketch reference generation started in background!\n\nWait, click 'Check Sketch Status', then 'Load Sketch Result' when complete.\n\n(Terminal will show model loading/generation progress.)", update_status(previous_status, "Sketch reference generation in background... Click 'Load Sketch Result' when done.", StatusMessage.INFO)
 
 def inpaint_video_background(video_state, video_caption, target_region_caption, previous_status, seed_param, cfg_scale, dilate_size):
     """Inpaint video - runs in background, returns immediately."""
@@ -776,7 +809,7 @@ def exact_replace_video_background(video_state, ref_image_input, ref_mask, video
             first_mask = np.array(validation_masks_pil[0])
             print(f"First mask after resize - pixel sum: {np.sum(first_mask)}")
 
-            reference_motion_guide = reference_motion_guide or "none"
+            reference_motion_guide_value = reference_motion_guide or "none"
             guide_images = None
             guide_mode = "none"
             generation_masks_pil = validation_masks_pil
@@ -791,7 +824,7 @@ def exact_replace_video_background(video_state, ref_image_input, ref_mask, video
             )
             if save_mask_bbox_stats:
                 save_mask_bbox_diagnostics_ui(os.path.join(GRADIO_TEMP_DIR, "inpaint", "mask_bbox_stats.json"), tracked_mask_arrays, target_bboxes)
-            if reference_motion_guide in {"full_region", "edge_refine"}:
+            if reference_motion_guide_value in {"full_region", "edge_refine"}:
                 guide_images = composite_object_guide_frames(
                     validation_images,
                     anydoor_first_frame_pil.resize((720, 480)),
@@ -799,10 +832,10 @@ def exact_replace_video_background(video_state, ref_image_input, ref_mask, video
                     tracked_mask_arrays,
                     target_bboxes=target_bboxes,
                 )
-                guide_mode = reference_motion_guide
+                guide_mode = reference_motion_guide_value
                 guide_images[0].save(os.path.join(GRADIO_TEMP_DIR, "inpaint", "guide_frame_000.png"))
                 guide_images[min(1, len(guide_images) - 1)].save(os.path.join(GRADIO_TEMP_DIR, "inpaint", "guide_frame_001.png"))
-                if reference_motion_guide == "edge_refine":
+                if reference_motion_guide_value == "edge_refine":
                     generation_masks_pil = build_edge_refine_masks(tracked_mask_arrays)
                     generation_masks_pil[0].save(os.path.join(GRADIO_TEMP_DIR, "inpaint", "guide_edge_first_mask.png"))
                 print(f"Using reference motion guide mode: {guide_mode}")
@@ -909,6 +942,46 @@ def load_latest_inpaint():
     return None, None, update_status([("", "")], "No inpainting result available. Try inpainting first.", StatusMessage.WARNING)
 
 
+def load_latest_sketch_reference():
+    """Load the latest sketch-generated reference image/mask if it exists."""
+    global latest_sketch_reference
+    if latest_sketch_reference:
+        ref_mask = latest_sketch_reference.get("ref_mask")
+        if ref_mask is None:
+            return (
+                latest_sketch_reference["ref_image"],
+                latest_sketch_reference["preview"],
+                [[], []],
+                None,
+                "✓ Reference image loaded. Auto mask failed; click the reference image to segment it manually.",
+                update_status([("", "")], "Loaded sketch reference image; manual mask refinement needed.", StatusMessage.WARNING),
+            )
+        return (
+            latest_sketch_reference["ref_image"],
+            latest_sketch_reference["preview"],
+            [[], []],
+            ref_mask,
+            "✓ Sketch reference image and mask loaded successfully!",
+            update_status([("", "")], "Loaded latest sketch reference result.", StatusMessage.SUCCESS),
+        )
+    return None, None, [[], []], None, "", update_status([("", "")], "No sketch reference result available. Generate one first.", StatusMessage.WARNING)
+
+
+def check_sketch_reference_status():
+    """Check only sketch-reference generation status."""
+    with processing_lock:
+        if processing_status["sketch_reference"]:
+            msg = processing_status["sketch_reference_message"]
+            return f"⏳ Sketch reference generation in progress...\n\n{msg}\n\nWait, then click 'Load Sketch Result'.", update_status([("", "")], f"Sketch reference: {msg}", StatusMessage.INFO)
+        if processing_status["sketch_reference_error"]:
+            error = processing_status["sketch_reference_error"]
+            processing_status["sketch_reference_error"] = ""
+            return f"❌ Sketch reference generation failed: {error}", update_status([("", "")], f"Error: {error}", StatusMessage.ERROR)
+    if latest_sketch_reference:
+        return "✓ Sketch reference complete. Click 'Load Sketch Result'.", update_status([("", "")], "Sketch reference complete.", StatusMessage.SUCCESS)
+    return "", update_status([("", "")], "No sketch reference generation running.", StatusMessage.INFO)
+
+
 def check_processing_status():
     """Check the current processing status and return a message."""
     with processing_lock:
@@ -922,6 +995,16 @@ def check_processing_status():
             # Clear error after reading
             processing_status["tracking_error"] = ""
             return None, f"❌ Tracking failed: {error}", \
+                   update_status([("", "")], f"Error: {error}", StatusMessage.ERROR)
+        # Check sketch-reference status
+        elif processing_status["sketch_reference"]:
+            msg = processing_status["sketch_reference_message"]
+            return None, f"⏳ Sketch reference generation in progress...\n\n{msg}\n\nWait, then click 'Load Sketch Result'.", \
+                   update_status([("", "")], f"Sketch reference: {msg}", StatusMessage.INFO)
+        elif processing_status["sketch_reference_error"]:
+            error = processing_status["sketch_reference_error"]
+            processing_status["sketch_reference_error"] = ""
+            return None, f"❌ Sketch reference generation failed: {error}", \
                    update_status([("", "")], f"Error: {error}", StatusMessage.ERROR)
         # Check inpainting status
         elif processing_status["inpainting"]:
@@ -1085,6 +1168,10 @@ def main():
                     reference_guidance_scale = gr.Slider(label="Reference Guidance Scale", minimum=3.0, maximum=12.0, step=0.1, value=6.5)
                     reference_controlnet_scale = gr.Slider(label="Reference ControlNet Scale", minimum=0.2, maximum=1.2, step=0.05, value=0.7)
                     sketch_generate_btn = gr.Button("Generate Reference From Sketch", variant="secondary")
+                    with gr.Row():
+                        sketch_check_status_btn = gr.Button("🔄 Check Sketch Status", size="sm")
+                        sketch_load_result_btn = gr.Button("🔄 Load Sketch Result", size="sm")
+                    sketch_progress = gr.Textbox(label="Sketch Reference Progress", interactive=False, lines=3)
 
                 gr.Markdown("### 🖼️ Reference Image (for Exact Replacement)")
                 ref_image_input = gr.Image(label="Upload Reference Image", type="numpy")
@@ -1219,7 +1306,19 @@ def main():
         sketch_generate_btn.click(
             fn=generate_reference_from_sketch,
             inputs=[sketch_image_input, video_state, sketch_label_input, sketch_attrs_input, sketch_candidate_count, reference_num_inference_steps, reference_guidance_scale, reference_controlnet_scale, seed_param, run_status],
-            outputs=[ref_image_input, ref_template, ref_click_state, ref_mask_state, run_status],
+            outputs=[sketch_progress, run_status],
+        )
+
+        sketch_check_status_btn.click(
+            fn=check_sketch_reference_status,
+            inputs=[],
+            outputs=[sketch_progress, run_status],
+        )
+
+        sketch_load_result_btn.click(
+            fn=load_latest_sketch_reference,
+            inputs=[],
+            outputs=[ref_image_input, ref_template, ref_click_state, ref_mask_state, sketch_progress, run_status],
         )
 
         ref_image_input.select(
