@@ -28,6 +28,30 @@ const modes: Array<{ id: Mode; label: string; icon: typeof Sparkles }> = [
   { id: "sketch", label: "Sketch", icon: Brush },
 ];
 
+type ImageSize = { width: number; height: number };
+
+function naturalImageSize(container: HTMLElement, fallback: ImageSize): ImageSize {
+  const image = container.querySelector("img");
+  return {
+    width: image?.naturalWidth || fallback.width,
+    height: image?.naturalHeight || fallback.height,
+  };
+}
+
+function mapClientToCoveredImagePoint(clientX: number, clientY: number, rect: DOMRect, imageSize: ImageSize) {
+  const scale = Math.max(rect.width / imageSize.width, rect.height / imageSize.height);
+  const renderedWidth = imageSize.width * scale;
+  const renderedHeight = imageSize.height * scale;
+  const offsetX = (rect.width - renderedWidth) / 2;
+  const offsetY = (rect.height - renderedHeight) / 2;
+  const x = (clientX - rect.left - offsetX) / scale;
+  const y = (clientY - rect.top - offsetY) / scale;
+  return {
+    x: Math.max(0, Math.min(imageSize.width - 1, x)),
+    y: Math.max(0, Math.min(imageSize.height - 1, y)),
+  };
+}
+
 function App() {
   const [session, setSession] = useState<SessionPayload | null>(null);
   const [mode, setMode] = useState<Mode>("sketch");
@@ -103,11 +127,10 @@ function App() {
     setNotice({ tone: "success", text: "Video loaded" });
   };
 
-  const addTargetPoint = async (clientX: number, clientY: number, rect: DOMRect) => {
+  const addTargetPoint = async (clientX: number, clientY: number, container: HTMLElement) => {
     if (!session || !hasVideo) return;
-    const x = ((clientX - rect.left) / rect.width) * 720;
-    const y = ((clientY - rect.top) / rect.height) * 480;
-    const payload = await api.addTargetPoint(session.session_id, x, y, pointLabel);
+    const point = mapClientToCoveredImagePoint(clientX, clientY, container.getBoundingClientRect(), naturalImageSize(container, { width: 720, height: 480 }));
+    const payload = await api.addTargetPoint(session.session_id, point.x, point.y, pointLabel);
     setTargetOverlayUrl(assetUrl(payload.overlay_url));
     await refreshSession();
   };
@@ -252,7 +275,7 @@ function App() {
                 Clear
               </button>
             </div>
-            <button className="target-frame" disabled={!hasVideo} onClick={(event) => addTargetPoint(event.clientX, event.clientY, event.currentTarget.getBoundingClientRect())}>
+            <button className="target-frame" disabled={!hasVideo} onClick={(event) => addTargetPoint(event.clientX, event.clientY, event.currentTarget)}>
               {currentFrame ? <img src={currentFrame} alt="Target frame" /> : <EmptyMedia icon={<Video />} label="Upload video" />}
               <span className={`point-pill ${pointLabel.toLowerCase()}`}>{pointLabel}</span>
             </button>
@@ -429,10 +452,9 @@ function ModeContent(props: ModeContentProps) {
       props.setReferenceUrl(assetUrl(payload.reference_url));
       props.setReferencePreviewUrl("");
     };
-    const addReferencePoint = async (clientX: number, clientY: number, rect: DOMRect) => {
+    const addReferencePoint = async (clientX: number, clientY: number, container: HTMLElement) => {
       if (!props.sessionId || !props.referenceUrl) return;
-      const x = ((clientX - rect.left) / rect.width) * 720;
-      const y = ((clientY - rect.top) / rect.height) * 480;
+      const { x, y } = mapClientToCoveredImagePoint(clientX, clientY, container.getBoundingClientRect(), naturalImageSize(container, { width: 720, height: 480 }));
       const payload = await api.addReferencePoint(props.sessionId, x, y, props.referencePointLabel);
       props.setReferencePreviewUrl(assetUrl(payload.preview_url));
     };
@@ -446,7 +468,7 @@ function ModeContent(props: ModeContentProps) {
               <input type="file" accept="image/*" onChange={(event) => uploadReference(event.target.files?.[0])} />
             </label>
           </div>
-          <button className="reference-frame" disabled={!props.referenceUrl} onClick={(event) => addReferencePoint(event.clientX, event.clientY, event.currentTarget.getBoundingClientRect())}>
+          <button className="reference-frame" disabled={!props.referenceUrl} onClick={(event) => addReferencePoint(event.clientX, event.clientY, event.currentTarget)}>
             {props.referencePreviewUrl || props.referenceUrl ? (
               <img src={props.referencePreviewUrl || props.referenceUrl} alt="Reference" />
             ) : (

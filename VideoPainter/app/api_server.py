@@ -20,24 +20,7 @@ from pydantic import BaseModel, Field
 from PIL import Image, ImageDraw
 import numpy as np
 
-
-SKETCH_MODE_DEFAULTS = {
-    "shape_conditioned_scribble": True,
-    "frame_shaped_reference": True,
-    "sketch_mask_fit_strength": 0.5,
-    "mask_contour_weight": 0.6,
-    "reference_controlnet_scale": 0.5,
-    "reference_num_inference_steps": 30,
-    "reference_guidance_scale": 6.5,
-    "candidate_count": 3,
-    "reference_propagation_mask_source": "video_target",
-    "edit_mask_mode": "propagation",
-    "reference_motion_guide": "none",
-    "dilate_size": 8,
-    "guide_dilate_size": 8,
-    "conditioning_video_mode": "full_video",
-    "anydoor_guidance_scale": 5.0,
-}
+from sketch_defaults import SKETCH_MODE_DEFAULTS
 
 
 class TargetPointRequest(BaseModel):
@@ -177,10 +160,12 @@ def write_demo_video(path: Path) -> Path:
 
 class DemoBridge:
     def upload_video(self, session: EditSession, upload_path: Path) -> Dict[str, Any]:
-        frame = Image.new("RGB", (720, 480), (12, 16, 26))
-        draw = ImageDraw.Draw(frame)
-        draw.rectangle((260, 130, 460, 350), outline=(42, 227, 255), width=4)
-        draw.text((24, 24), "Frame 0 target preview", fill=(230, 245, 255))
+        frame = read_first_frame(upload_path)
+        if frame is None:
+            frame = Image.new("RGB", (720, 480), (12, 16, 26))
+            draw = ImageDraw.Draw(frame)
+            draw.rectangle((260, 130, 460, 350), outline=(42, 227, 255), width=4)
+            draw.text((24, 24), "Frame 0 target preview", fill=(230, 245, 255))
         frame_path = session.root / "frame_000.png"
         frame.save(frame_path)
         session.video_state = {"demo": True, "video_name": upload_path.name, "masks": []}
@@ -227,6 +212,19 @@ class DemoBridge:
         path = session.root / "reference_segmented.png"
         image.save(path)
         return path
+
+
+def read_first_frame(video_path: Path) -> Optional[Image.Image]:
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        ok, frame = capture.read()
+    finally:
+        capture.release()
+    if not ok or frame is None:
+        return None
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame = cv2.resize(frame, (720, 480), interpolation=cv2.INTER_LINEAR)
+    return Image.fromarray(frame).convert("RGB")
 
 
 class LegacyBridge:

@@ -1,0 +1,17 @@
+SKETCH_MODE_DEFAULTS = {
+    "shape_conditioned_scribble": True,
+    "frame_shaped_reference": True,
+    "sketch_mask_fit_strength": 0.5,
+    "mask_contour_weight": 0.6,
+    "reference_controlnet_scale": 0.5,
+    "reference_num_inference_steps": 30,
+    "reference_guidance_scale": 6.5,
+    "candidate_count": 3,
+    "reference_propagation_mask_source": "video_target",
+    "edit_mask_mode": "propagation",
+    "reference_motion_guide": "none",
+    "dilate_size": 8,
+    "guide_dilate_size": 8,
+    "conditioning_video_mode": "full_video",
+    "anydoor_guidance_scale": 5.0,
+}
