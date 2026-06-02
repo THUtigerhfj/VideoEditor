@@ -24,13 +24,13 @@ os.chdir(APP)
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from anydoor_bridge import replace_first_frame_with_anydoor  # noqa: E402
-from frame_conditioning import build_edge_refine_masks, build_union_edit_masks, composite_object_guide_frames, finalize_propagation_sequence, mask_bbox, mask_bbox_trajectory, smooth_mask_bboxes  # noqa: E402
+from frame_conditioning import build_anydoor_background_inpaint_mask, build_edge_refine_masks, build_lama_background_inpaint_mask, build_union_edit_masks, composite_object_guide_frames, finalize_propagation_sequence, mask_bbox, mask_bbox_trajectory, prepare_anydoor_target_image, select_anydoor_target_mask, smooth_mask_bboxes  # noqa: E402
 from reference_segmenter import clean_binary_mask, detect_object_box_with_grounding_dino, segment_box_with_sam2  # noqa: E402
 from sam2.build_sam import build_sam2, build_sam2_video_predictor  # noqa: E402
 from sam2.sam2_image_predictor import SAM2ImagePredictor  # noqa: E402
 from sketch_reference_workflow import generate_reference_assets  # noqa: E402
 import utils as vp_utils  # noqa: E402
-from utils import REFERENCE_PREV_CLIP_WEIGHT, build_reference_propagation_prompt, generate_frames, load_model  # noqa: E402
+from utils import REFERENCE_PREV_CLIP_WEIGHT, build_reference_propagation_prompt, generate_frames, load_model, run_flux_fill_inpaint, run_lama_inpaint, run_lama_video_inpaint  # noqa: E402
 
 
 def parse_points(value):
@@ -360,9 +360,64 @@ def run_reference_replacement(args, dirs, frames, masks, pil_frames, pil_masks, 
 
     target_first = Image.fromarray(frames[0]).convert("RGB")
     target_mask = Image.fromarray((masks[0].squeeze() * 255).astype(np.uint8)).convert("L")
+    target_mask_arr = np.asarray(target_mask, dtype=np.uint8)
+    reference_mask_arr = np.asarray(reference_mask.convert("L"), dtype=np.uint8)
+    anydoor_target_mask_arr = select_anydoor_target_mask(reference_mask_arr, target_mask_arr, output_size=(720, 480))
+    pre_inpaint_mode = getattr(args, "anydoor_pre_inpaint_mode", "lama")
+    metadata["anydoor_pre_inpaint_mode"] = pre_inpaint_mode
+    if pre_inpaint_mode == "flux":
+        background_mask_arr = build_anydoor_background_inpaint_mask(
+            target_mask_arr,
+            dilate_size=getattr(args, "anydoor_background_mask_dilate", 0),
+        )
+        Image.fromarray(background_mask_arr).convert("L").save(dirs["masks"] / "flux_background_mask.png")
+        background_prompt = getattr(args, "anydoor_background_prompt", "") or (
+            "unoccupied tabletop and laptop keyboard area, continuous desk and laptop surfaces matching the surrounding scene, same lighting, perspective, reflections, focus, and background texture"
+        )
+        metadata["anydoor_background_prompt"] = background_prompt
+        flux_background = run_flux_fill_inpaint(
+            image=target_first,
+            mask_image=Image.fromarray(background_mask_arr).convert("L"),
+            pipe_img_inpainting=args.img_inpainting_model,
+            prompt=background_prompt,
+            seed=args.seed,
+            guidance_scale=getattr(args, "anydoor_background_guidance_scale", 30.0),
+            num_inference_steps=getattr(args, "anydoor_background_num_inference_steps", 50),
+            device=args.device,
+        )
+        flux_background.save(dirs["first_frames"] / "flux_background_first_frame.png")
+        anydoor_target_image_arr = np.asarray(flux_background.convert("RGB"), dtype=np.uint8)
+    elif pre_inpaint_mode == "lama":
+        lama_mask_arr = build_lama_background_inpaint_mask(
+            target_mask_arr,
+            mode=getattr(args, "anydoor_lama_mask_mode", "rect"),
+            padding=getattr(args, "anydoor_lama_mask_padding", 24),
+            dilate_size=getattr(args, "anydoor_lama_mask_dilate", 31),
+        )
+        Image.fromarray(lama_mask_arr).convert("L").save(dirs["masks"] / "lama_background_mask.png")
+        metadata["anydoor_lama_mask_mode"] = getattr(args, "anydoor_lama_mask_mode", "rect")
+        metadata["anydoor_lama_mask_padding"] = getattr(args, "anydoor_lama_mask_padding", 24)
+        metadata["anydoor_lama_mask_dilate"] = getattr(args, "anydoor_lama_mask_dilate", 31)
+        lama_background = run_lama_inpaint(
+            image=target_first,
+            mask_image=Image.fromarray(lama_mask_arr).convert("L"),
+            lama_model=getattr(args, "lama_model", None),
+            device=args.device,
+        )
+        lama_background.save(dirs["first_frames"] / "lama_background_first_frame.png")
+        anydoor_target_image_arr = np.asarray(lama_background.convert("RGB"), dtype=np.uint8)
+    elif pre_inpaint_mode == "off":
+        anydoor_target_image_arr = frames[0].copy()
+    elif pre_inpaint_mode == "opencv":
+        anydoor_target_image_arr = prepare_anydoor_target_image(frames[0], target_mask_arr, anydoor_target_mask_arr)
+    else:
+        raise ValueError(f"Unsupported anydoor_pre_inpaint_mode: {pre_inpaint_mode}")
+    Image.fromarray(anydoor_target_image_arr).convert("RGB").save(dirs["first_frames"] / "anydoor_target_input.png")
+    Image.fromarray(anydoor_target_mask_arr).convert("L").save(dirs["masks"] / "anydoor_target_mask.png")
+    target_mask.save(dirs["masks"] / "cogvideox_video_target_first_mask.png")
     replaced_first = replace_first_frame_with_anydoor(
-        target_image=target_first,
-        target_mask=target_mask,
+        target_image=Image.fromarray(anydoor_target_image_arr).convert("RGB"),
+        target_mask=Image.fromarray(anydoor_target_mask_arr).convert("L"),
         reference_image=reference_image,
         reference_mask=reference_mask,
         guidance_scale=args.anydoor_guidance_scale,
@@ -373,7 +428,7 @@ def run_reference_replacement(args, dirs, frames, masks, pil_frames, pil_masks, 
 
     propagation_masks = masks
     propagation_mask_source = "video_target"
-    guide_object_mask = (masks[0].squeeze() * 255).astype(np.uint8)
+    guide_object_mask = anydoor_target_mask_arr
     if args.reference_propagation_mask_source in {"anydoor_object", "anydoor_object_sam2"}:
         tracking_frames = frames.copy()
         tracking_frames[0] = np.asarray(replaced_first.resize((720, 480)).convert("RGB"), dtype=np.uint8)
@@ -414,7 +469,6 @@ def run_reference_replacement(args, dirs, frames, masks, pil_frames, pil_masks, 
     metadata["reference_propagation_mask_source"] = propagation_mask_source
     reference_motion_guide = getattr(args, "reference_motion_guide", "none")
     metadata["reference_motion_guide"] = reference_motion_guide
-    metadata["conditioning_video_mode"] = getattr(args, "conditioning_video_mode", "full_video")
     metadata["guide_edge_inner_erode"] = getattr(args, "guide_edge_inner_erode", 4)
     metadata["guide_edge_outer_dilate"] = getattr(args, "guide_edge_outer_dilate", 8)
     metadata["mask_bbox_smoothing"] = getattr(args, "mask_bbox_smoothing", "off")
@@ -463,6 +517,27 @@ def run_reference_replacement(args, dirs, frames, masks, pil_frames, pil_masks, 
             generation_masks[0].save(dirs["masks"] / "guide_edge_first_mask.png")
             metadata["effective_edit_mask_mode"] = "edge_refine"
 
+    conditioning_mode = getattr(args, "conditioning_video_mode", "full_video")
+    metadata["conditioning_video_mode"] = conditioning_mode
+    conditioning_frames = [img.copy() for img in pil_frames]
+    effective_conditioning_mode = conditioning_mode
+    if conditioning_mode == "lama_cleaned_video":
+        metadata["conditioning_video_lama_mask_mode"] = getattr(args, "conditioning_lama_mask_mode", getattr(args, "anydoor_lama_mask_mode", "rect"))
+        metadata["conditioning_video_lama_mask_padding"] = getattr(args, "conditioning_lama_mask_padding", 48)
+        metadata["conditioning_video_lama_mask_dilate"] = getattr(args, "conditioning_lama_mask_dilate", getattr(args, "anydoor_lama_mask_dilate", 31))
+        conditioning_frames = run_lama_video_inpaint(
+            images=conditioning_frames,
+            masks=[mask.copy() for mask in pil_masks],
+            lama_model=getattr(args, "lama_model", None),
+            mask_mode=metadata["conditioning_video_lama_mask_mode"],
+            mask_padding=metadata["conditioning_video_lama_mask_padding"],
+            mask_dilate=metadata["conditioning_video_lama_mask_dilate"],
+            device=args.device,
+            output_dir=dirs["first_frames"],
+        )
+        effective_conditioning_mode = "full_video"
+        (dirs["first_frames"] / "lama_conditioning_video_mode.txt").write_text("lama_cleaned_video\n")
+
     pipe, _ = load_model(
         model_path=args.model_path,
         inpainting_branch=args.inpainting_branch,
@@ -471,7 +546,7 @@ def run_reference_replacement(args, dirs, frames, masks, pil_frames, pil_masks, 
         device=args.device,
     )
     propagated = generate_frames(
-        images=[img.copy() for img in pil_frames],
+        images=[img.copy() for img in conditioning_frames],
         masks=[mask.copy() for mask in generation_masks],
         pipe=pipe,
         pipe_img_inpainting=None,
@@ -487,7 +562,7 @@ def run_reference_replacement(args, dirs, frames, masks, pil_frames, pil_masks, 
         guide_images=[img.copy() for img in guide_images] if guide_images is not None else None,
         guide_mode=guide_mode,
         guide_dilate_size=getattr(args, "guide_dilate_size", None),
-        conditioning_video_mode=getattr(args, "conditioning_video_mode", "full_video"),
+        conditioning_video_mode=effective_conditioning_mode,
     )
     propagated_uint8 = finalize_propagation_sequence(propagated, fallback_first_frame=replaced_first.resize((720, 480)))
     propagated_first = Image.fromarray(propagated_uint8[0]).convert("RGB")
@@ -504,6 +579,9 @@ def run_reference_replacement(args, dirs, frames, masks, pil_frames, pil_masks, 
 
 
 def run(args):
+    if args.dilate_size is None:
+        args.dilate_size = 0 if args.mode in {"image_reference", "sketch_reference"} else 16
+
     dirs = ensure_run_dirs(args.output_dir)
     os.environ["GRADIO_TEMP_DIR"] = str(dirs["root"] / "tmp_gradio")
     vp_utils.GRADIO_TEMP_DIR = os.environ["GRADIO_TEMP_DIR"]
@@ -579,6 +657,7 @@ def run(args):
                 sketch_mask_fit_strength=args.sketch_mask_fit_strength,
                 mask_contour_weight=args.mask_contour_weight,
                 frame_shaped_reference=args.frame_shaped_reference,
+                frame_shaped_reference_object_scale=args.frame_shaped_reference_object_scale,
             )
             metadata["reference_meta"] = sketch_result["metadata"]
             reference_image = Image.open(sketch_result["reference_image_path"]).convert("RGB")
@@ -622,7 +701,8 @@ def build_parser():
     parser.add_argument("--shape_conditioned_scribble", action="store_true", help="Add the video frame0 target mask contour to the sketch ControlNet input.")
     parser.add_argument("--sketch_mask_fit_strength", type=float, default=0.5, help="Reserved strength for fitting sketch control to frame0 mask shape.")
     parser.add_argument("--mask_contour_weight", type=float, default=0.6, help="Weight/enable value for frame0 mask contour in shape-conditioned scribble.")
-    parser.add_argument("--frame_shaped_reference", action="store_true", help="Fit selected reference object into the original 720x480 frame0 target mask and use that mask as reference_mask.")
+    parser.add_argument("--frame_shaped_reference", action="store_true", help="Fit selected reference object into the original 720x480 frame0 target mask bbox.")
+    parser.add_argument("--frame_shaped_reference_object_scale", type=float, default=0.82, help="Scale for the fitted sketch reference object inside the frame0 target bbox. The resulting smaller object mask is used by AnyDoor; CogVideoX can still use the original video target masks.")
     parser.add_argument(
         "--video_caption",
         required=True,
@@ -634,13 +714,25 @@ def build_parser():
     parser.add_argument("--target_object_caption", default="", help="Required for text_prompt; for image_reference/sketch_reference it is appended to the propagation prompt when provided.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cfg_scale", type=float, default=6.0)
-    parser.add_argument("--dilate_size", type=int, default=16)
+    parser.add_argument("--dilate_size", type=int, default=None)
     parser.add_argument("--sam2_dilate_iter", type=int, default=6)
     parser.add_argument("--anydoor_guidance_scale", type=float, default=5.0)
+    parser.add_argument("--anydoor_pre_inpaint_mode", choices=["off", "opencv", "flux", "lama"], default="lama", help="How to remove the original target before AnyDoor. lama uses prompt-free LaMa object removal; flux uses FLUX.1 Fill.")
+    parser.add_argument("--anydoor_background_prompt", default="unoccupied tabletop and laptop keyboard area, continuous desk and laptop surfaces matching the surrounding scene, same lighting, perspective, reflections, focus, and background texture", help="Prompt used when --anydoor_pre_inpaint_mode flux.")
+    parser.add_argument("--anydoor_background_mask_dilate", type=int, default=0, help="Optional dilation kernel size before building the rectangular FLUX background inpaint mask.")
+    parser.add_argument("--anydoor_background_guidance_scale", type=float, default=30.0, help="FLUX Fill guidance scale for AnyDoor background pre-inpainting.")
+    parser.add_argument("--anydoor_background_num_inference_steps", type=int, default=50, help="FLUX Fill inference steps for AnyDoor background pre-inpainting.")
+    parser.add_argument("--lama_model", default=str(ROOT / "ckpt" / "lama" / "big-lama.pt"), help="Local LaMa torchscript model used when --anydoor_pre_inpaint_mode lama.")
+    parser.add_argument("--anydoor_lama_mask_mode", choices=["rect", "dilate", "exact"], default="rect", help="Mask shape for LaMa background cleanup before AnyDoor.")
+    parser.add_argument("--anydoor_lama_mask_padding", type=int, default=24, help="Padding in pixels for rect LaMa cleanup mask.")
+    parser.add_argument("--anydoor_lama_mask_dilate", type=int, default=31, help="Dilation kernel size for dilate LaMa cleanup mask.")
     parser.add_argument("--reference_prev_clip_weight", type=float, default=REFERENCE_PREV_CLIP_WEIGHT, help="Identity-preserving previous-clip weight for image_reference and sketch_reference propagation.")
-    parser.add_argument("--reference_propagation_mask_source", choices=["anydoor_object", "anydoor_object_sam2", "video_target"], default="anydoor_object", help="Mask source for image_reference/sketch_reference propagation. anydoor_object re-segments the AnyDoor first frame and fits that object shape to the original video mask motion; anydoor_object_sam2 tracks the object mask with SAM2; video_target keeps the original clicked video mask.")
+    parser.add_argument("--reference_propagation_mask_source", choices=["anydoor_object", "anydoor_object_sam2", "video_target"], default="video_target", help="Mask source for image_reference/sketch_reference propagation. video_target keeps the original clicked video mask; anydoor_object re-segments the AnyDoor first frame and fits that object shape to the original video mask motion; anydoor_object_sam2 tracks the object mask with SAM2.")
     parser.add_argument("--reference_motion_guide", choices=["none", "full_region", "edge_refine"], default="none", help="Experimental guide mode for reference replacement. none keeps masked-video conditioning; full_region composites the reference object into conditioning frames; edge_refine composites the object and asks VideoPainter to refine boundary masks.")
-    parser.add_argument("--conditioning_video_mode", choices=["masked_video", "full_video"], default="full_video", help="Conditioning video mode for reference replacement. full_video keeps original pixels visible like the initial reference pipeline while still passing masks separately; masked_video blacks out edit regions before CogVideoX and is kept for debugging/backward comparisons.")
+    parser.add_argument("--conditioning_video_mode", choices=["lama_cleaned_video", "masked_video", "full_video"], default="lama_cleaned_video", help="Conditioning video mode for reference replacement. lama_cleaned_video removes the original target from every conditioning frame with LaMa while preserving the original masks; full_video keeps original pixels visible; masked_video blacks out edit regions.")
+    parser.add_argument("--conditioning_lama_mask_mode", choices=["rect", "dilate", "exact"], default="rect", help="Mask shape for per-frame LaMa conditioning cleanup.")
+    parser.add_argument("--conditioning_lama_mask_padding", type=int, default=48, help="Padding in pixels for rect per-frame LaMa cleanup mask. This does not change the CogVideoX edit masks.")
+    parser.add_argument("--conditioning_lama_mask_dilate", type=int, default=31, help="Dilation kernel size for per-frame LaMa cleanup mask.")
     parser.add_argument(
         "--edit_mask_mode",
         choices=["propagation", "union_target_object"],
@@ -653,9 +745,9 @@ def build_parser():
     )
     parser.add_argument("--guide_edge_inner_erode", type=int, default=4)
     parser.add_argument("--guide_edge_outer_dilate", type=int, default=8)
-    parser.add_argument("--guide_dilate_size", type=int, default=4, help="Mask dilation size used when reference_motion_guide=edge_refine.")
+    parser.add_argument("--guide_dilate_size", type=int, default=0, help="Mask dilation size used when reference_motion_guide=edge_refine.")
     parser.add_argument("--mask_bbox_smoothing", choices=["off", "median"], default="off", help="Temporal smoothing for per-frame target mask bboxes before composing reference guide frames.")
-    parser.add_argument("--mask_bbox_smoothing_window", type=int, default=5, help="Median window for mask bbox smoothing.")
+    parser.add_argument("--mask_bbox_smoothing_window", type=int, default=0, help="Median window for mask bbox smoothing.")
     parser.add_argument("--mask_bbox_max_scale_delta", type=float, default=0.08, help="Maximum per-frame relative width/height change after bbox smoothing.")
     parser.add_argument("--save_mask_bbox_stats", action="store_true", help="Save per-frame mask bbox diagnostics to mask_bbox_stats.json.")
     parser.add_argument("--model_path", default=str(ROOT / "ckpt" / "CogVideoX-5b-I2V"))

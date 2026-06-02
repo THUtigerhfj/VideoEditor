@@ -266,3 +266,5 @@ frontend/tsconfig.tsbuildinfo
 !frontend/tsconfig.json
 !frontend/src/
 !frontend/src/**
+
+report

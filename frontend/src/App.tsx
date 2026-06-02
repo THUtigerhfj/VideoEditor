@@ -21,6 +21,7 @@ import { PointerEvent, ReactNode, forwardRef, useCallback, useEffect, useImperat
 import { api, apiBase, assetUrl, JobPayload, Mode, PointLabel, SessionPayload } from "./api/client";
 
 type Notice = { tone: "info" | "success" | "error"; text: string };
+type ReferenceStrategy = "lama_background" | "mask_twist";
 
 const modes: Array<{ id: Mode; label: string; icon: typeof Sparkles }> = [
   { id: "prompt", label: "Prompt", icon: Sparkles },
@@ -28,7 +29,49 @@ const modes: Array<{ id: Mode; label: string; icon: typeof Sparkles }> = [
   { id: "sketch", label: "Sketch", icon: Brush },
 ];
 
+const referenceStrategies: Array<{ id: ReferenceStrategy; label: string; description: string }> = [
+  {
+    id: "lama_background",
+    label: "LaMa clean",
+    description: "Small reference object, LaMa background cleanup, original video masks.",
+  },
+  {
+    id: "mask_twist",
+    label: "Mask twist",
+    description: "Fit/twist reference to the original frame-0 mask size and keep full-video conditioning.",
+  },
+];
+
+function replacementSettingsForStrategy(referenceStrategy: ReferenceStrategy) {
+  if (referenceStrategy === "mask_twist") {
+    return {
+      reference_strategy: referenceStrategy,
+      anydoor_pre_inpaint_mode: "off",
+      reference_propagation_mask_source: "video_target",
+      reference_motion_guide: "none",
+      edit_mask_mode: "propagation",
+      guide_dilate_size: 0,
+      dilate_size: 0,
+    };
+  }
+  return {
+    reference_strategy: referenceStrategy,
+    anydoor_pre_inpaint_mode: "lama",
+    reference_propagation_mask_source: "video_target",
+    reference_motion_guide: "none",
+    edit_mask_mode: "propagation",
+    guide_dilate_size: 0,
+    dilate_size: 0,
+  };
+}
+
 type ImageSize = { width: number; height: number };
+
+function freshAssetUrl(path?: unknown): string {
+  const url = assetUrl(path);
+  if (!url) return "";
+  return `${url}${url.includes("?") ? "&" : "?"}v=${Date.now()}`;
+}
 
 function naturalImageSize(container: HTMLElement, fallback: ImageSize): ImageSize {
   const image = container.querySelector("img");
@@ -66,7 +109,8 @@ function App() {
   const [attrs, setAttrs] = useState("metallic, realistic, studio lighting");
   const [seed, setSeed] = useState(42);
   const [cfgScale, setCfgScale] = useState(6);
-  const [dilateSize, setDilateSize] = useState(8);
+  const [dilateSize, setDilateSize] = useState(0);
+  const [referenceStrategy, setReferenceStrategy] = useState<ReferenceStrategy>("lama_background");
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [activeJob, setActiveJob] = useState<JobPayload | null>(null);
   const [resultUrl, setResultUrl] = useState("");
@@ -91,7 +135,7 @@ function App() {
         const next = await api.getJob(activeJob.job_id);
         setActiveJob(next);
         if (next.state === "succeeded") {
-          const videoUrl = assetUrl(next.result.video_url);
+          const videoUrl = freshAssetUrl(next.result.video_url);
           setResultUrl(videoUrl);
           setIsBusy(false);
           setNotice({ tone: "success", text: `${next.type} complete` });
@@ -118,20 +162,24 @@ function App() {
 
   const uploadVideo = async (file?: File) => {
     if (!session || !file) return;
-    setNotice({ tone: "info", text: "Loading video" });
-    const payload = await api.uploadVideo(session.session_id, file);
-    setFrameUrl(assetUrl(payload.frame_url));
-    setTargetOverlayUrl("");
-    setResultUrl("");
-    await refreshSession();
-    setNotice({ tone: "success", text: "Video loaded" });
+    try {
+      setNotice({ tone: "info", text: "Loading video" });
+      const payload = await api.uploadVideo(session.session_id, file);
+      setFrameUrl(freshAssetUrl(payload.frame_url));
+      setTargetOverlayUrl("");
+      setResultUrl("");
+      await refreshSession();
+      setNotice({ tone: "success", text: "Video loaded" });
+    } catch (error) {
+      setNotice({ tone: "error", text: `Video upload failed: ${(error as Error).message}` });
+    }
   };
 
   const addTargetPoint = async (clientX: number, clientY: number, container: HTMLElement) => {
     if (!session || !hasVideo) return;
     const point = mapClientToCoveredImagePoint(clientX, clientY, container.getBoundingClientRect(), naturalImageSize(container, { width: 720, height: 480 }));
     const payload = await api.addTargetPoint(session.session_id, point.x, point.y, pointLabel);
-    setTargetOverlayUrl(assetUrl(payload.overlay_url));
+    setTargetOverlayUrl(freshAssetUrl(payload.overlay_url));
     await refreshSession();
   };
 
@@ -139,7 +187,7 @@ function App() {
     if (!session || !hasVideo) return;
     const payload = await api.clearTargetPoints(session.session_id);
     setTargetOverlayUrl("");
-    setFrameUrl(assetUrl(payload.frame_url));
+    setFrameUrl(freshAssetUrl(payload.frame_url));
     await refreshSession();
   };
 
@@ -150,7 +198,7 @@ function App() {
       const job = await runner();
       setActiveJob(job);
       if (job.state === "succeeded") {
-        setResultUrl(assetUrl(job.result.video_url));
+        setResultUrl(freshAssetUrl(job.result.video_url));
         setIsBusy(false);
         setNotice({ tone: "success", text: `${job.type} complete` });
       }
@@ -167,6 +215,7 @@ function App() {
 
   const generate = () => {
     if (!session) return;
+    const replacementSettings = replacementSettingsForStrategy(referenceStrategy);
     if (mode === "prompt") {
       startJob(() =>
         api.generatePrompt(session.session_id, {
@@ -186,14 +235,24 @@ function App() {
           target_region_caption: targetCaption,
           seed,
           cfg_scale: cfgScale,
-          dilate_size: dilateSize,
+          dilate_size: replacementSettings.dilate_size,
           anydoor_guidance_scale: 5,
-          reference_propagation_mask_source: "anydoor_object",
-          reference_motion_guide: "none",
-          edit_mask_mode: "propagation",
-          guide_dilate_size: 8,
+          anydoor_pre_inpaint_mode: replacementSettings.anydoor_pre_inpaint_mode,
+          anydoor_background_prompt:
+            "unoccupied tabletop and laptop keyboard area, continuous desk and laptop surfaces matching the surrounding scene, same lighting, perspective, reflections, focus, and background texture",
+          anydoor_background_mask_dilate: 0,
+          anydoor_background_guidance_scale: 30,
+          anydoor_background_num_inference_steps: 50,
+          anydoor_lama_mask_mode: "rect",
+          anydoor_lama_mask_padding: 24,
+          anydoor_lama_mask_dilate: 31,
+          reference_propagation_mask_source: replacementSettings.reference_propagation_mask_source,
+          reference_motion_guide: replacementSettings.reference_motion_guide,
+          edit_mask_mode: replacementSettings.edit_mask_mode,
+          guide_dilate_size: replacementSettings.guide_dilate_size,
+          reference_strategy: replacementSettings.reference_strategy,
           mask_bbox_smoothing: "off",
-          mask_bbox_smoothing_window: 5,
+          mask_bbox_smoothing_window: 0,
           mask_bbox_max_scale_delta: 0.08,
           save_mask_bbox_stats: false,
         }),
@@ -213,6 +272,7 @@ function App() {
         video_caption: videoCaption,
         target_region_caption: targetCaption,
         seed,
+        reference_strategy: referenceStrategy,
       }),
     );
   };
@@ -268,7 +328,14 @@ function App() {
               <label className="file-button">
                 <Upload size={17} />
                 <span>Video</span>
-                <input type="file" accept="video/*" onChange={(event) => uploadVideo(event.target.files?.[0])} />
+                <input
+                  type="file"
+                  accept="video/*"
+                  onChange={(event) => {
+                    void uploadVideo(event.target.files?.[0]);
+                    event.currentTarget.value = "";
+                  }}
+                />
               </label>
               <button className="ghost-button" onClick={clearTarget} disabled={!hasVideo}>
                 <RotateCcw size={16} />
@@ -311,6 +378,8 @@ function App() {
               setTargetCaption={setTargetCaption}
               attrs={attrs}
               setAttrs={setAttrs}
+              referenceStrategy={referenceStrategy}
+              setReferenceStrategy={setReferenceStrategy}
               sketchRef={sketchRef}
             />
           </Panel>
@@ -340,6 +409,7 @@ function App() {
         setCfgScale={setCfgScale}
         dilateSize={dilateSize}
         setDilateSize={setDilateSize}
+        referenceStrategy={referenceStrategy}
         job={activeJob}
         session={session}
       />
@@ -424,12 +494,28 @@ interface ModeContentProps {
   setTargetCaption: (value: string) => void;
   attrs: string;
   setAttrs: (value: string) => void;
+  referenceStrategy: ReferenceStrategy;
+  setReferenceStrategy: (value: ReferenceStrategy) => void;
   sketchRef: React.RefObject<SketchCanvasHandle | null>;
 }
 
 function ModeContent(props: ModeContentProps) {
+  const strategyControl = props.mode === "prompt" ? null : (
+    <div className="strategy-card">
+      <span>Reference strategy</span>
+      <div className="segmented strategy-toggle">
+        {referenceStrategies.map((strategy) => (
+          <button key={strategy.id} className={props.referenceStrategy === strategy.id ? "selected" : ""} onClick={() => props.setReferenceStrategy(strategy.id)}>
+            {strategy.label}
+          </button>
+        ))}
+      </div>
+      <p>{referenceStrategies.find((strategy) => strategy.id === props.referenceStrategy)?.description}</p>
+    </div>
+  );
   const commonPrompts = (
     <div className="prompt-stack">
+      {strategyControl}
       <label>
         <span>Video prompt</span>
         <textarea value={props.videoCaption} onChange={(event) => props.setVideoCaption(event.target.value)} rows={4} />
@@ -448,15 +534,19 @@ function ModeContent(props: ModeContentProps) {
   if (props.mode === "image") {
     const uploadReference = async (file?: File) => {
       if (!props.sessionId || !file) return;
-      const payload = await api.uploadReference(props.sessionId, file);
-      props.setReferenceUrl(assetUrl(payload.reference_url));
-      props.setReferencePreviewUrl("");
+      try {
+        const payload = await api.uploadReference(props.sessionId, file);
+        props.setReferenceUrl(freshAssetUrl(payload.reference_url));
+        props.setReferencePreviewUrl("");
+      } catch (error) {
+        console.error("Reference upload failed", error);
+      }
     };
     const addReferencePoint = async (clientX: number, clientY: number, container: HTMLElement) => {
       if (!props.sessionId || !props.referenceUrl) return;
       const { x, y } = mapClientToCoveredImagePoint(clientX, clientY, container.getBoundingClientRect(), naturalImageSize(container, { width: 720, height: 480 }));
       const payload = await api.addReferencePoint(props.sessionId, x, y, props.referencePointLabel);
-      props.setReferencePreviewUrl(assetUrl(payload.preview_url));
+      props.setReferencePreviewUrl(freshAssetUrl(payload.preview_url));
     };
     return (
       <div className="mode-surface split">
@@ -465,7 +555,14 @@ function ModeContent(props: ModeContentProps) {
             <label className="file-button">
               <Upload size={17} />
               Reference
-              <input type="file" accept="image/*" onChange={(event) => uploadReference(event.target.files?.[0])} />
+              <input
+                type="file"
+                accept="image/*"
+                onChange={(event) => {
+                  void uploadReference(event.target.files?.[0]);
+                  event.currentTarget.value = "";
+                }}
+              />
             </label>
           </div>
           <button className="reference-frame" disabled={!props.referenceUrl} onClick={(event) => addReferencePoint(event.clientX, event.clientY, event.currentTarget)}>
@@ -493,6 +590,7 @@ function ModeContent(props: ModeContentProps) {
     <div className="mode-surface sketch-mode">
       <SketchCanvas ref={props.sketchRef} />
       <div className="prompt-stack">
+        {strategyControl}
         <label>
           <span>Target object</span>
           <input value={props.targetCaption} onChange={(event) => props.setTargetCaption(event.target.value)} />
@@ -651,6 +749,7 @@ function AdvancedDrawer({
   setCfgScale,
   dilateSize,
   setDilateSize,
+  referenceStrategy,
   job,
   session,
 }: {
@@ -662,6 +761,7 @@ function AdvancedDrawer({
   setCfgScale: (value: number) => void;
   dilateSize: number;
   setDilateSize: (value: number) => void;
+  referenceStrategy: ReferenceStrategy;
   job: JobPayload | null;
   session: SessionPayload | null;
 }) {
@@ -700,7 +800,11 @@ function AdvancedDrawer({
       </div>
       <div className="debug-box">
         <span>Sketch defaults</span>
-        <code>video_target / propagation / full_video</code>
+        <code>
+          {referenceStrategy === "lama_background"
+            ? "lama_background / video_target / propagation / lama_cleaned_video"
+            : "mask_twist / video_target / propagation / full_video"}
+        </code>
       </div>
     </aside>
   );

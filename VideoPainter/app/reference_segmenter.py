@@ -31,7 +31,26 @@ def ensure_model_snapshot(repo_id: str, cache_dir):
     from huggingface_hub import snapshot_download
 
     cleanup_incomplete_model_blobs(repo_id, cache_dir)
-    return snapshot_download(repo_id=repo_id, cache_dir=cache_dir, resume_download=True)
+    try:
+        return snapshot_download(repo_id=repo_id, cache_dir=cache_dir, resume_download=True, local_files_only=True)
+    except Exception:
+        return snapshot_download(repo_id=repo_id, cache_dir=cache_dir, resume_download=True)
+
+
+def _from_pretrained_cache_first(loader, model_id: str, **kwargs):
+    try:
+        return loader.from_pretrained(model_id, local_files_only=True, **kwargs)
+    except Exception as local_error:
+        print(f"Local cache load failed for {model_id}; trying Hugging Face Hub: {local_error}")
+        return loader.from_pretrained(model_id, **kwargs)
+
+
+def _pipeline_cache_first(pipeline_fn, task: str, model_id: str, **kwargs):
+    try:
+        return pipeline_fn(task, model=model_id, local_files_only=True, **kwargs)
+    except Exception as local_error:
+        print(f"Local cache load failed for {model_id}; trying Hugging Face Hub: {local_error}")
+        return pipeline_fn(task, model=model_id, **kwargs)
 
 
 def _to_uint8_mask(mask) -> np.ndarray:
@@ -133,8 +152,8 @@ def _load_grounding_dino(cache_dir: str, device: str):
     from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
     cleanup_incomplete_model_blobs(GROUNDING_DINO_MODEL_ID, cache_dir)
-    processor = AutoProcessor.from_pretrained(GROUNDING_DINO_MODEL_ID, cache_dir=cache_dir)
-    model = AutoModelForZeroShotObjectDetection.from_pretrained(GROUNDING_DINO_MODEL_ID, cache_dir=cache_dir)
+    processor = _from_pretrained_cache_first(AutoProcessor, GROUNDING_DINO_MODEL_ID, cache_dir=cache_dir)
+    model = _from_pretrained_cache_first(AutoModelForZeroShotObjectDetection, GROUNDING_DINO_MODEL_ID, cache_dir=cache_dir)
     model.to(device)
     model.eval()
     return processor, model
@@ -186,7 +205,14 @@ def _load_birefnet_pipeline(cache_dir: str, device: str):
 
     cleanup_incomplete_model_blobs(BIREFNET_MODEL_ID, cache_dir)
     device_id = 0 if str(device).startswith('cuda') else -1
-    return pipeline('image-segmentation', model=BIREFNET_MODEL_ID, trust_remote_code=True, device=device_id, cache_dir=cache_dir)
+    return _pipeline_cache_first(
+        pipeline,
+        'image-segmentation',
+        BIREFNET_MODEL_ID,
+        trust_remote_code=True,
+        device=device_id,
+        cache_dir=cache_dir,
+    )
 
 
 def fallback_segment_with_birefnet(image, cache_dir: str, device: str = "cuda"):

@@ -22,11 +22,12 @@ import gradio as gr
 from sam2.build_sam import build_sam2_video_predictor, build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-from frame_conditioning import build_edge_refine_masks, build_union_edit_masks, composite_object_guide_frames, finalize_propagation_sequence, mask_bbox, mask_bbox_trajectory, smooth_mask_bboxes
+from frame_conditioning import build_anydoor_background_inpaint_mask, build_edge_refine_masks, build_lama_background_inpaint_mask, build_union_edit_masks, composite_object_guide_frames, finalize_propagation_sequence, mask_bbox, mask_bbox_trajectory, prepare_anydoor_target_image, select_anydoor_target_mask, smooth_mask_bboxes
 from reference_segmenter import clean_binary_mask, detect_object_box_with_grounding_dino, segment_box_with_sam2
-from utils import REFERENCE_PREV_CLIP_WEIGHT, build_reference_propagation_prompt, load_model, generate_frames
+from utils import REFERENCE_PREV_CLIP_WEIGHT, build_reference_propagation_prompt, load_model, generate_frames, run_flux_fill_inpaint, run_lama_inpaint, run_lama_video_inpaint
 import threading
 from anydoor_bridge import replace_first_frame_with_anydoor
+from sketch_defaults import REFERENCE_STRATEGY_LABELS, SKETCH_MODE_DEFAULTS, reference_strategy_settings
 from sketch_reference_workflow import build_reference_preview, generate_reference_assets, load_reference_assets_for_ui
 
 # Gradio temp directory (absolute path)
@@ -495,7 +496,7 @@ def semantic_segment_reference(ref_image, point_prompt, click_state, evt: gr.Sel
     return painted_image, click_state, mask
 
 
-def generate_reference_from_sketch(sketch_image, video_state, label, attrs, candidate_count, reference_num_inference_steps, reference_guidance_scale, reference_controlnet_scale, shape_conditioned_scribble, sketch_mask_fit_strength, mask_contour_weight, frame_shaped_reference, seed_param, previous_status):
+def generate_reference_from_sketch(sketch_image, video_state, label, attrs, reference_strategy, candidate_count, reference_num_inference_steps, reference_guidance_scale, reference_controlnet_scale, shape_conditioned_scribble, sketch_mask_fit_strength, mask_contour_weight, frame_shaped_reference, frame_shaped_reference_object_scale, seed_param, previous_status):
     """Start sketch-to-reference generation in a background thread.
 
     README notes that this Gradio version has a short request timeout, so heavy
@@ -523,6 +524,10 @@ def generate_reference_from_sketch(sketch_image, video_state, label, attrs, cand
         target_mask_for_shape = (np.squeeze(video_state["masks"][0]) > 0).astype(np.uint8) * 255
 
     seed = int(seed_param) if int(seed_param) >= 0 else -1
+    strategy = reference_strategy_settings(reference_strategy)
+    shape_conditioned_scribble = strategy["shape_conditioned_scribble"]
+    frame_shaped_reference = strategy["frame_shaped_reference"]
+    frame_shaped_reference_object_scale = strategy["frame_shaped_reference_object_scale"]
     run_dir = os.path.join(GRADIO_TEMP_DIR, "sketch_ref", str(int(time.time() * 1000)))
     os.makedirs(run_dir, exist_ok=True)
 
@@ -556,6 +561,7 @@ def generate_reference_from_sketch(sketch_image, video_state, label, attrs, cand
                 sketch_mask_fit_strength=float(sketch_mask_fit_strength),
                 mask_contour_weight=float(mask_contour_weight),
                 frame_shaped_reference=bool(frame_shaped_reference),
+                frame_shaped_reference_object_scale=float(frame_shaped_reference_object_scale),
             )
             with processing_lock:
                 processing_status["sketch_reference_message"] = "Loading generated reference assets..."
@@ -694,7 +700,7 @@ def inpaint_video_background(video_state, video_caption, target_region_caption, 
            update_status(previous_status, "Processing in background... Click 'Load Latest Result' when done.", StatusMessage.INFO)
 
 
-def exact_replace_video_background(video_state, ref_image_input, ref_mask, video_caption, target_region_caption, previous_status, seed_param, cfg_scale, dilate_size, anydoor_guidance_scale, reference_propagation_mask_source, reference_motion_guide, edit_mask_mode, guide_dilate_size, mask_bbox_smoothing, mask_bbox_smoothing_window, mask_bbox_max_scale_delta, save_mask_bbox_stats):
+def exact_replace_video_background(video_state, ref_image_input, ref_mask, video_caption, target_region_caption, previous_status, seed_param, cfg_scale, dilate_size, anydoor_guidance_scale, reference_strategy, reference_propagation_mask_source, reference_motion_guide, edit_mask_mode, guide_dilate_size, mask_bbox_smoothing, mask_bbox_smoothing_window, mask_bbox_max_scale_delta, save_mask_bbox_stats, anydoor_pre_inpaint_mode="lama", anydoor_background_prompt="unoccupied tabletop and laptop keyboard area, continuous desk and laptop surfaces matching the surrounding scene, same lighting, perspective, reflections, focus, and background texture", anydoor_background_mask_dilate=0, anydoor_background_guidance_scale=30.0, anydoor_background_num_inference_steps=50, lama_model=os.path.join(APP_DIR, "../ckpt/lama/big-lama.pt"), anydoor_lama_mask_mode="rect", anydoor_lama_mask_padding=24, anydoor_lama_mask_dilate=31):
     """Exact object replacement - runs in background, returns immediately."""
     seed = int(seed_param) if int(seed_param) >= 0 else np.random.randint(0, 2**32 - 1)
 
@@ -706,6 +712,14 @@ def exact_replace_video_background(video_state, ref_image_input, ref_mask, video
         return None, "", update_status(previous_status, "Please segment the reference image first.", StatusMessage.ERROR)
     if video_state.get("masks") is None or len(video_state["masks"]) == 0:
         return None, "", update_status(previous_status, "Please track the video first.", StatusMessage.ERROR)
+
+    strategy = reference_strategy_settings(reference_strategy)
+    dilate_size = strategy["dilate_size"]
+    reference_propagation_mask_source = strategy["reference_propagation_mask_source"]
+    reference_motion_guide = strategy["reference_motion_guide"]
+    edit_mask_mode = strategy["edit_mask_mode"]
+    guide_dilate_size = strategy["guide_dilate_size"]
+    anydoor_pre_inpaint_mode = strategy["anydoor_pre_inpaint_mode"]
 
     # Check if already processing
     with processing_lock:
@@ -751,17 +765,74 @@ def exact_replace_video_background(video_state, ref_image_input, ref_mask, video
             tar_image = np.array(validation_images[0]).copy()
             tar_mask_arr = (validation_masks[0] > 128).astype(np.uint8) * 255
             ref_mask_arr = (np.array(ref_mask) > 0).astype(np.uint8) * 255
+            anydoor_target_mask_arr = select_anydoor_target_mask(
+                ref_mask_arr,
+                tar_mask_arr,
+                output_size=(720, 480),
+                preserve_full_frame_reference=strategy["reference_strategy"] == "mask_twist",
+            )
+            anydoor_pre_inpaint_mode_value = anydoor_pre_inpaint_mode or "lama"
+            background_mask_arr = None
+            if anydoor_pre_inpaint_mode_value == "flux":
+                with processing_lock:
+                    processing_status["inpainting_message"] = "Stage 1/3: Running FLUX background inpainting..."
+                print("Running FLUX background inpainting before AnyDoor...")
+                background_mask_arr = build_anydoor_background_inpaint_mask(
+                    tar_mask_arr,
+                    dilate_size=int(anydoor_background_mask_dilate),
+                )
+                anydoor_target_image_pil = run_flux_fill_inpaint(
+                    image=Image.fromarray(tar_image).convert("RGB"),
+                    mask_image=Image.fromarray(background_mask_arr).convert("L"),
+                    pipe_img_inpainting=validation_pipeline_img,
+                    prompt=anydoor_background_prompt,
+                    seed=seed,
+                    guidance_scale=float(anydoor_background_guidance_scale),
+                    num_inference_steps=int(anydoor_background_num_inference_steps),
+                    device="cuda",
+                    video_pipe=validation_pipeline,
+                )
+                anydoor_target_image_arr = np.asarray(anydoor_target_image_pil.convert("RGB"), dtype=np.uint8)
+            elif anydoor_pre_inpaint_mode_value == "lama":
+                with processing_lock:
+                    processing_status["inpainting_message"] = "Stage 1/3: Running LaMa background cleanup..."
+                print("Running LaMa background cleanup before AnyDoor...")
+                background_mask_arr = build_lama_background_inpaint_mask(
+                    tar_mask_arr,
+                    mode=anydoor_lama_mask_mode,
+                    padding=int(anydoor_lama_mask_padding),
+                    dilate_size=int(anydoor_lama_mask_dilate),
+                )
+                anydoor_target_image_pil = run_lama_inpaint(
+                    image=Image.fromarray(tar_image).convert("RGB"),
+                    mask_image=Image.fromarray(background_mask_arr).convert("L"),
+                    lama_model=lama_model,
+                    device="cuda",
+                    video_pipe=validation_pipeline,
+                )
+                anydoor_target_image_arr = np.asarray(anydoor_target_image_pil.convert("RGB"), dtype=np.uint8)
+            elif anydoor_pre_inpaint_mode_value == "off":
+                anydoor_target_image_arr = tar_image.copy()
+            elif anydoor_pre_inpaint_mode_value == "opencv":
+                anydoor_target_image_arr = prepare_anydoor_target_image(tar_image, tar_mask_arr, anydoor_target_mask_arr)
+            else:
+                raise ValueError(f"Unsupported AnyDoor pre-inpaint mode: {anydoor_pre_inpaint_mode_value}")
             reference_image = Image.fromarray(np.asarray(ref_image_input, dtype=np.uint8)).convert('RGB')
 
-            print(f"Target mask: sum={np.sum(tar_mask_arr)}, Reference mask: sum={np.sum(ref_mask_arr)}")
+            print(
+                "Target masks: "
+                f"video_sum={np.sum(tar_mask_arr)}, "
+                f"anydoor_sum={np.sum(anydoor_target_mask_arr)}, "
+                f"reference_sum={np.sum(ref_mask_arr)}"
+            )
 
             try:
                 print("Running AnyDoor replacement...")
                 validation_pipeline.to("cpu")
                 torch.cuda.empty_cache()
                 gen_image = replace_first_frame_with_anydoor(
-                    target_image=Image.fromarray(tar_image).convert('RGB'),
-                    target_mask=Image.fromarray(tar_mask_arr, mode='L'),
+                    target_image=Image.fromarray(anydoor_target_image_arr).convert('RGB'),
+                    target_mask=Image.fromarray(anydoor_target_mask_arr, mode='L'),
                     reference_image=reference_image,
                     reference_mask=Image.fromarray(ref_mask_arr, mode='L'),
                     guidance_scale=float(anydoor_guidance_scale),
@@ -782,8 +853,24 @@ def exact_replace_video_background(video_state, ref_image_input, ref_mask, video
 
             os.makedirs(os.path.join(GRADIO_TEMP_DIR, "inpaint"), exist_ok=True)
             Image.fromarray(validation_images[0]).save(os.path.join(GRADIO_TEMP_DIR, "inpaint", "first_frame_anydoor.png"))
+            Image.fromarray(anydoor_target_image_arr).convert('RGB').save(
+                os.path.join(GRADIO_TEMP_DIR, "inpaint", "anydoor_target_input.png")
+            )
+            Image.fromarray(anydoor_target_mask_arr).convert('L').save(
+                os.path.join(GRADIO_TEMP_DIR, "inpaint", "anydoor_target_mask.png")
+            )
+            if anydoor_pre_inpaint_mode_value in {"flux", "lama"} and background_mask_arr is not None:
+                Image.fromarray(background_mask_arr).convert('L').save(
+                    os.path.join(GRADIO_TEMP_DIR, "inpaint", f"{anydoor_pre_inpaint_mode_value}_background_mask.png")
+                )
+                Image.fromarray(anydoor_target_image_arr).convert('RGB').save(
+                    os.path.join(GRADIO_TEMP_DIR, "inpaint", f"{anydoor_pre_inpaint_mode_value}_background_first_frame.png")
+                )
+            Image.fromarray(tar_mask_arr).convert('L').save(
+                os.path.join(GRADIO_TEMP_DIR, "inpaint", "cogvideox_video_target_first_mask.png")
+            )
 
-            reference_propagation_mask_source_value = reference_propagation_mask_source or "anydoor_object"
+            reference_propagation_mask_source_value = reference_propagation_mask_source or "video_target"
             if reference_propagation_mask_source_value == "video_target":
                 object_mask = tar_mask_arr
                 tracked_masks = np.asarray([((mask > 0).astype(np.uint8))[:, :, None] for mask in validation_masks], dtype=np.uint8)
@@ -857,10 +944,11 @@ def exact_replace_video_background(video_state, ref_image_input, ref_mask, video
             if save_mask_bbox_stats:
                 save_mask_bbox_diagnostics_ui(os.path.join(GRADIO_TEMP_DIR, "inpaint", "mask_bbox_stats.json"), tracked_mask_arrays, target_bboxes)
             if reference_motion_guide_value in {"full_region", "edge_refine"}:
+                guide_object_mask_for_first_frame = anydoor_target_mask_arr if propagation_mask_source == "video_target" else object_mask
                 guide_images = composite_object_guide_frames(
                     validation_images,
                     anydoor_first_frame_pil.resize((720, 480)),
-                    (np.asarray(object_mask) > 0).astype(np.uint8) * 255,
+                    (np.asarray(guide_object_mask_for_first_frame) > 0).astype(np.uint8) * 255,
                     tracked_mask_arrays,
                     target_bboxes=target_bboxes,
                 )
@@ -888,8 +976,32 @@ def exact_replace_video_background(video_state, ref_image_input, ref_mask, video
                     processing_status["inpainting_message"] = f"Stage 2/3: {message} ({int(100*step/total)}%)"
                 print(f"[Background Progress] {processing_status['inpainting_message']}")
 
+            conditioning_images = validation_images
+            conditioning_video_mode_value = "full_video"
+            if anydoor_pre_inpaint_mode_value == "lama":
+                with processing_lock:
+                    processing_status["inpainting_message"] = "Stage 2/3: Cleaning conditioning video with LaMa..."
+                original_target_masks_pil = [
+                    Image.fromarray(mask.astype(np.uint8)).convert("RGB").resize((720, 480))
+                    for mask in original_target_mask_arrays
+                ]
+                conditioning_images = run_lama_video_inpaint(
+                    images=[img.copy() for img in validation_images],
+                    masks=original_target_masks_pil,
+                    lama_model=lama_model,
+                    mask_mode=anydoor_lama_mask_mode,
+                    mask_padding=int(SKETCH_MODE_DEFAULTS.get("conditioning_lama_mask_padding", 48)),
+                    mask_dilate=int(anydoor_lama_mask_dilate),
+                    device="cuda",
+                    progress_callback=progress_callback,
+                    output_dir=os.path.join(GRADIO_TEMP_DIR, "inpaint"),
+                )
+                conditioning_video_mode_value = "full_video"
+                conditioning_images[0] = anydoor_first_frame_pil.copy()
+                print("Using LaMa-cleaned conditioning video with original CogVideoX masks.")
+
             images = generate_frames(
-                images=validation_images,
+                images=conditioning_images,
                 masks=generation_masks_pil,
                 pipe=validation_pipeline,
                 pipe_img_inpainting=validation_pipeline_img,
@@ -906,7 +1018,7 @@ def exact_replace_video_background(video_state, ref_image_input, ref_mask, video
                 guide_images=guide_images,
                 guide_mode=guide_mode,
                 guide_dilate_size=int(guide_dilate_size),
-                conditioning_video_mode="full_video",
+                conditioning_video_mode=conditioning_video_mode_value,
             )
 
             print("Stage 2/3: CogVideoX propagation complete!")
@@ -1196,14 +1308,21 @@ def main():
                     sketch_image_input = gr.Image(label="Upload Sketch", type="numpy")
                     sketch_label_input = gr.Textbox(label="Object Label", placeholder="Required, e.g. apple")
                     sketch_attrs_input = gr.Textbox(label="Optional Attributes", placeholder="e.g. red, glossy")
-                    sketch_candidate_count = gr.Slider(label="Candidate Count", minimum=1, maximum=8, step=1, value=2)
-                    reference_num_inference_steps = gr.Slider(label="Reference Steps", minimum=20, maximum=80, step=1, value=40)
-                    reference_guidance_scale = gr.Slider(label="Reference Guidance Scale", minimum=3.0, maximum=12.0, step=0.1, value=6.5)
-                    reference_controlnet_scale = gr.Slider(label="Reference ControlNet Scale", minimum=0.2, maximum=1.2, step=0.05, value=0.7)
-                    shape_conditioned_scribble = gr.Checkbox(label="Use Frame0 Mask Shape For Sketch Reference", value=False)
-                    sketch_mask_fit_strength = gr.Slider(label="Sketch Mask Fit Strength", minimum=0.0, maximum=1.0, step=0.05, value=0.5)
-                    mask_contour_weight = gr.Slider(label="Mask Contour Weight", minimum=0.0, maximum=1.0, step=0.05, value=0.6)
-                    frame_shaped_reference = gr.Checkbox(label="Frame-Shaped Reference Mask", value=False)
+                    reference_strategy = gr.Radio(
+                        choices=list(REFERENCE_STRATEGY_LABELS.keys()),
+                        value=SKETCH_MODE_DEFAULTS["reference_strategy"],
+                        label="Reference Strategy",
+                        info="lama_background is the current default; mask_twist fits the generated reference to the original video mask size/shape.",
+                    )
+                    sketch_candidate_count = gr.Slider(label="Candidate Count", minimum=1, maximum=8, step=1, value=SKETCH_MODE_DEFAULTS["candidate_count"])
+                    reference_num_inference_steps = gr.Slider(label="Reference Steps", minimum=20, maximum=80, step=1, value=SKETCH_MODE_DEFAULTS["reference_num_inference_steps"])
+                    reference_guidance_scale = gr.Slider(label="Reference Guidance Scale", minimum=3.0, maximum=12.0, step=0.1, value=SKETCH_MODE_DEFAULTS["reference_guidance_scale"])
+                    reference_controlnet_scale = gr.Slider(label="Reference ControlNet Scale", minimum=0.2, maximum=1.2, step=0.05, value=SKETCH_MODE_DEFAULTS["reference_controlnet_scale"])
+                    shape_conditioned_scribble = gr.Checkbox(label="Use Frame0 Mask Shape For Sketch Reference", value=SKETCH_MODE_DEFAULTS["shape_conditioned_scribble"])
+                    sketch_mask_fit_strength = gr.Slider(label="Sketch Mask Fit Strength", minimum=0.0, maximum=1.0, step=0.05, value=SKETCH_MODE_DEFAULTS["sketch_mask_fit_strength"])
+                    mask_contour_weight = gr.Slider(label="Mask Contour Weight", minimum=0.0, maximum=1.0, step=0.05, value=SKETCH_MODE_DEFAULTS["mask_contour_weight"])
+                    frame_shaped_reference = gr.Checkbox(label="Frame-Shaped Reference Object", value=SKETCH_MODE_DEFAULTS["frame_shaped_reference"])
+                    frame_shaped_reference_object_scale = gr.Slider(label="Frame-Shaped Reference Object Scale", minimum=0.5, maximum=1.0, step=0.01, value=SKETCH_MODE_DEFAULTS["frame_shaped_reference_object_scale"])
                     sketch_generate_btn = gr.Button("Generate Reference From Sketch", variant="secondary")
                     with gr.Row():
                         sketch_check_status_btn = gr.Button("🔄 Check Sketch Status", size="sm")
@@ -1233,7 +1352,7 @@ def main():
 
                 reference_propagation_mask_source = gr.Radio(
                     choices=["anydoor_object", "anydoor_object_sam2", "video_target"],
-                    value="anydoor_object",
+                    value="video_target",
                     label="Reference Propagation Mask Source",
                     info="Use video_target for same-shape replacements; use anydoor_object for replacement-object-shaped propagation.",
                 )
@@ -1250,9 +1369,47 @@ def main():
                     label="Edit Mask Mode",
                     info="union_target_object edits both the original clicked target mask and the propagated replacement-object mask.",
                 )
-                guide_dilate_size = gr.Slider(label="Guide Dilate Size", minimum=0, maximum=32, step=1, value=4)
+                anydoor_pre_inpaint_mode = gr.Radio(
+                    choices=["lama", "flux", "opencv", "off"],
+                    value=SKETCH_MODE_DEFAULTS["anydoor_pre_inpaint_mode"],
+                    label="AnyDoor Pre-Inpaint Mode",
+                    info="lama removes the old object with prompt-free LaMa before AnyDoor; flux is kept for comparison.",
+                )
+                anydoor_background_prompt = gr.Textbox(
+                    label="AnyDoor Background Prompt",
+                    value=SKETCH_MODE_DEFAULTS["anydoor_background_prompt"],
+                    lines=2,
+                )
+                anydoor_background_mask_dilate = gr.Slider(
+                    label="AnyDoor Background Mask Dilate",
+                    minimum=0,
+                    maximum=64,
+                    step=1,
+                    value=SKETCH_MODE_DEFAULTS["anydoor_background_mask_dilate"],
+                )
+                anydoor_lama_mask_mode = gr.Radio(
+                    choices=["rect", "dilate", "exact"],
+                    value=SKETCH_MODE_DEFAULTS["anydoor_lama_mask_mode"],
+                    label="LaMa Mask Mode",
+                    info="rect with padding is the current default object-removal cleanup mask.",
+                )
+                anydoor_lama_mask_padding = gr.Slider(
+                    label="LaMa Rect Padding",
+                    minimum=0,
+                    maximum=80,
+                    step=1,
+                    value=SKETCH_MODE_DEFAULTS["anydoor_lama_mask_padding"],
+                )
+                anydoor_lama_mask_dilate = gr.Slider(
+                    label="LaMa Dilate Kernel",
+                    minimum=1,
+                    maximum=81,
+                    step=2,
+                    value=SKETCH_MODE_DEFAULTS["anydoor_lama_mask_dilate"],
+                )
+                guide_dilate_size = gr.Slider(label="Guide Dilate Size", minimum=0, maximum=32, step=1, value=SKETCH_MODE_DEFAULTS["guide_dilate_size"])
                 mask_bbox_smoothing = gr.Radio(choices=["off", "median"], value="off", label="Mask Bbox Smoothing")
-                mask_bbox_smoothing_window = gr.Slider(label="Mask Bbox Smoothing Window", minimum=1, maximum=15, step=2, value=5)
+                mask_bbox_smoothing_window = gr.Slider(label="Mask Bbox Smoothing Window", minimum=0, maximum=15, step=1, value=0)
                 mask_bbox_max_scale_delta = gr.Slider(label="Mask Bbox Max Scale Delta", minimum=0.0, maximum=0.3, step=0.01, value=0.08)
                 save_mask_bbox_stats = gr.Checkbox(label="Save Mask Bbox Stats", value=False)
 
@@ -1277,7 +1434,7 @@ def main():
                 with gr.Accordion("Advanced Settings", open=False):
                     seed_param = gr.Number(label="Seed (-1 for random)", value=42, minimum=-1)
                     cfg_scale = gr.Slider(label="CFG Scale", value=6.0, minimum=1.0, maximum=10.0, step=0.1)
-                    dilate_size = gr.Slider(label="Dilate Size", value=16, minimum=0, maximum=32, step=1)
+                    dilate_size = gr.Slider(label="Dilate Size", value=SKETCH_MODE_DEFAULTS["dilate_size"], minimum=0, maximum=32, step=1)
 
                 video_info = gr.Textbox(label="Video Info", interactive=False)
 
@@ -1355,7 +1512,7 @@ def main():
 
         sketch_generate_btn.click(
             fn=generate_reference_from_sketch,
-            inputs=[sketch_image_input, video_state, sketch_label_input, sketch_attrs_input, sketch_candidate_count, reference_num_inference_steps, reference_guidance_scale, reference_controlnet_scale, shape_conditioned_scribble, sketch_mask_fit_strength, mask_contour_weight, frame_shaped_reference, seed_param, run_status],
+            inputs=[sketch_image_input, video_state, sketch_label_input, sketch_attrs_input, reference_strategy, sketch_candidate_count, reference_num_inference_steps, reference_guidance_scale, reference_controlnet_scale, shape_conditioned_scribble, sketch_mask_fit_strength, mask_contour_weight, frame_shaped_reference, frame_shaped_reference_object_scale, seed_param, run_status],
             outputs=[sketch_progress, run_status],
         )
 
@@ -1391,7 +1548,7 @@ def main():
 
         exact_replace_btn.click(
             fn=exact_replace_video_background,
-            inputs=[video_state, ref_image_input, ref_mask_state, video_caption, target_region_caption, run_status, seed_param, cfg_scale, dilate_size, anydoor_guidance_scale, reference_propagation_mask_source, reference_motion_guide, edit_mask_mode, guide_dilate_size, mask_bbox_smoothing, mask_bbox_smoothing_window, mask_bbox_max_scale_delta, save_mask_bbox_stats],
+            inputs=[video_state, ref_image_input, ref_mask_state, video_caption, target_region_caption, run_status, seed_param, cfg_scale, dilate_size, anydoor_guidance_scale, reference_strategy, reference_propagation_mask_source, reference_motion_guide, edit_mask_mode, guide_dilate_size, mask_bbox_smoothing, mask_bbox_smoothing_window, mask_bbox_max_scale_delta, save_mask_bbox_stats, anydoor_pre_inpaint_mode, anydoor_background_prompt, anydoor_background_mask_dilate, gr.State(SKETCH_MODE_DEFAULTS["anydoor_background_guidance_scale"]), gr.State(SKETCH_MODE_DEFAULTS["anydoor_background_num_inference_steps"]), gr.State(os.path.join(APP_DIR, "../ckpt/lama/big-lama.pt")), anydoor_lama_mask_mode, anydoor_lama_mask_padding, anydoor_lama_mask_dilate],
             outputs=[video_output, inpaint_progress, run_status],
         )
 

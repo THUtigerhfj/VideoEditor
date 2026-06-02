@@ -68,7 +68,7 @@ def _mask_bbox(mask_arr: np.ndarray):
     return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
 
 
-def fit_reference_to_frame_mask(reference_image: Image.Image, reference_mask, target_mask, output_size=(720, 480)):
+def fit_reference_to_frame_mask(reference_image: Image.Image, reference_mask, target_mask, output_size=(720, 480), object_scale: float = 1.0):
     image_arr = np.asarray(reference_image.convert("RGB"), dtype=np.uint8)
     ref = np.asarray(reference_mask, dtype=np.uint8)
     if ref.ndim == 3:
@@ -90,14 +90,30 @@ def fit_reference_to_frame_mask(reference_image: Image.Image, reference_mask, ta
     alpha_crop = ref[ry0 : ry1 + 1, rx0 : rx1 + 1]
     target_w = tx1 - tx0 + 1
     target_h = ty1 - ty0 + 1
+    object_scale = min(1.0, max(0.05, float(object_scale)))
+    scaled_w = max(1, int(round(target_w * object_scale)))
+    scaled_h = max(1, int(round(target_h * object_scale)))
     resized_rgb = np.asarray(Image.fromarray(object_crop).resize((target_w, target_h), Image.BICUBIC), dtype=np.uint8)
     resized_alpha = np.asarray(Image.fromarray(alpha_crop).resize((target_w, target_h), Image.NEAREST), dtype=np.uint8)
+    if object_scale >= 1.0:
+        resized_alpha = target[ty0 : ty1 + 1, tx0 : tx1 + 1]
+    else:
+        resized_rgb = np.asarray(Image.fromarray(resized_rgb).resize((scaled_w, scaled_h), Image.BICUBIC), dtype=np.uint8)
+        resized_alpha = np.asarray(Image.fromarray(resized_alpha).resize((scaled_w, scaled_h), Image.NEAREST), dtype=np.uint8)
 
     canvas = np.full((output_size[1], output_size[0], 3), 255, dtype=np.uint8)
+    mask_canvas = np.zeros((output_size[1], output_size[0]), dtype=np.uint8)
+    x0 = int(round((tx0 + tx1 + 1 - resized_rgb.shape[1]) / 2.0))
+    y0 = int(round((ty0 + ty1 + 1 - resized_rgb.shape[0]) / 2.0))
+    x0 = max(0, min(output_size[0] - resized_rgb.shape[1], x0))
+    y0 = max(0, min(output_size[1] - resized_rgb.shape[0], y0))
+    x1 = x0 + resized_rgb.shape[1]
+    y1 = y0 + resized_rgb.shape[0]
     alpha = (resized_alpha > 0).astype(np.float32)[:, :, None]
-    patch = canvas[ty0 : ty1 + 1, tx0 : tx1 + 1]
+    patch = canvas[y0:y1, x0:x1]
     patch[:] = np.clip(alpha * resized_rgb.astype(np.float32) + (1.0 - alpha) * patch.astype(np.float32), 0, 255).astype(np.uint8)
-    return Image.fromarray(canvas).convert("RGB"), Image.fromarray(target).convert("L")
+    mask_canvas[y0:y1, x0:x1] = np.where(resized_alpha > 0, resized_alpha, mask_canvas[y0:y1, x0:x1]).astype(np.uint8)
+    return Image.fromarray(canvas).convert("RGB"), Image.fromarray(mask_canvas).convert("L")
 
 
 def score_shape_compatibility(candidate_mask, target_mask):
@@ -184,6 +200,7 @@ def generate_reference_assets(
     sketch_mask_fit_strength: float = 0.5,
     mask_contour_weight: float = 0.6,
     frame_shaped_reference: bool = False,
+    frame_shaped_reference_object_scale: float = 1.0,
 ) -> dict[str, Any]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -302,6 +319,7 @@ def generate_reference_assets(
             "sketch_mask_fit_strength": float(sketch_mask_fit_strength),
             "mask_contour_weight": float(mask_contour_weight),
             "frame_shaped_reference": bool(frame_shaped_reference),
+            "frame_shaped_reference_object_scale": float(frame_shaped_reference_object_scale),
             "cache_dir": str(cache_dir),
             "best_candidate_index": None,
             "reference_image": str(reference_image_path),
@@ -332,6 +350,7 @@ def generate_reference_assets(
             best_mask,
             target_mask_for_shape,
             output_size=(720, 480),
+            object_scale=frame_shaped_reference_object_scale,
         )
         best_mask = np.asarray(best_mask_pil.convert("L"), dtype=np.uint8)
         best["image"] = best_image.copy()
@@ -354,6 +373,7 @@ def generate_reference_assets(
         "sketch_mask_fit_strength": float(sketch_mask_fit_strength),
         "mask_contour_weight": float(mask_contour_weight),
         "frame_shaped_reference": bool(frame_shaped_reference),
+        "frame_shaped_reference_object_scale": float(frame_shaped_reference_object_scale),
         "cache_dir": str(cache_dir),
         "best_candidate_index": int(best["index"]),
         "reference_image": str(reference_image_path),

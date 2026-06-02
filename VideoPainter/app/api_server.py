@@ -20,7 +20,10 @@ from pydantic import BaseModel, Field
 from PIL import Image, ImageDraw
 import numpy as np
 
-from sketch_defaults import SKETCH_MODE_DEFAULTS
+from sketch_defaults import SKETCH_MODE_DEFAULTS, reference_strategy_settings
+
+VIDEO_PAINTER_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CKPT_ROOT = VIDEO_PAINTER_ROOT / "ckpt"
 
 
 class TargetPointRequest(BaseModel):
@@ -38,13 +41,24 @@ class PromptGenerateRequest(BaseModel):
 
 
 class ImageGenerateRequest(PromptGenerateRequest):
+    reference_strategy: str = SKETCH_MODE_DEFAULTS["reference_strategy"]
+    dilate_size: int = 0
     anydoor_guidance_scale: float = 5.0
-    reference_propagation_mask_source: str = "anydoor_object"
+    anydoor_pre_inpaint_mode: str = "lama"
+    anydoor_background_prompt: str = "unoccupied tabletop and laptop keyboard area, continuous desk and laptop surfaces matching the surrounding scene, same lighting, perspective, reflections, focus, and background texture"
+    anydoor_background_mask_dilate: int = 0
+    anydoor_background_guidance_scale: float = 30.0
+    anydoor_background_num_inference_steps: int = 50
+    lama_model: str = str(DEFAULT_CKPT_ROOT / "lama" / "big-lama.pt")
+    anydoor_lama_mask_mode: str = "rect"
+    anydoor_lama_mask_padding: int = 24
+    anydoor_lama_mask_dilate: int = 31
+    reference_propagation_mask_source: str = "video_target"
     reference_motion_guide: str = "none"
     edit_mask_mode: str = "propagation"
-    guide_dilate_size: int = 8
+    guide_dilate_size: int = 0
     mask_bbox_smoothing: str = "off"
-    mask_bbox_smoothing_window: int = 5
+    mask_bbox_smoothing_window: int = 0
     mask_bbox_max_scale_delta: float = 0.08
     save_mask_bbox_stats: bool = False
 
@@ -56,6 +70,7 @@ class SketchGenerateRequest(BaseModel):
     video_caption: str = ""
     target_region_caption: str = ""
     seed: int = 42
+    reference_strategy: str = SKETCH_MODE_DEFAULTS["reference_strategy"]
 
 
 @dataclass
@@ -289,6 +304,7 @@ class LegacyBridge:
         )
 
     def start_image_generation(self, session: EditSession, request: ImageGenerateRequest) -> None:
+        strategy = reference_strategy_settings(request.reference_strategy)
         self.legacy.exact_replace_video_background(
             session.video_state,
             session.ref_image,
@@ -298,19 +314,30 @@ class LegacyBridge:
             [("", "")],
             request.seed,
             request.cfg_scale,
-            request.dilate_size,
+            strategy["dilate_size"],
             request.anydoor_guidance_scale,
-            request.reference_propagation_mask_source,
-            request.reference_motion_guide,
-            request.edit_mask_mode,
-            request.guide_dilate_size,
+            strategy["reference_strategy"],
+            strategy["reference_propagation_mask_source"],
+            strategy["reference_motion_guide"],
+            strategy["edit_mask_mode"],
+            strategy["guide_dilate_size"],
             request.mask_bbox_smoothing,
             request.mask_bbox_smoothing_window,
             request.mask_bbox_max_scale_delta,
             request.save_mask_bbox_stats,
+            strategy["anydoor_pre_inpaint_mode"],
+            request.anydoor_background_prompt,
+            request.anydoor_background_mask_dilate,
+            request.anydoor_background_guidance_scale,
+            request.anydoor_background_num_inference_steps,
+            request.lama_model,
+            request.anydoor_lama_mask_mode,
+            request.anydoor_lama_mask_padding,
+            request.anydoor_lama_mask_dilate,
         )
 
     def run_sketch_generation(self, session: EditSession, request: SketchGenerateRequest, job: Job) -> None:
+        strategy = reference_strategy_settings(request.reference_strategy)
         sketch = decode_data_url_image(request.sketch_image)
         job.stage = "Generating reference candidates"
         job.progress = 10
@@ -319,14 +346,16 @@ class LegacyBridge:
             session.video_state,
             request.label,
             request.attrs,
+            strategy["reference_strategy"],
             SKETCH_MODE_DEFAULTS["candidate_count"],
             SKETCH_MODE_DEFAULTS["reference_num_inference_steps"],
             SKETCH_MODE_DEFAULTS["reference_guidance_scale"],
             SKETCH_MODE_DEFAULTS["reference_controlnet_scale"],
-            SKETCH_MODE_DEFAULTS["shape_conditioned_scribble"],
+            strategy["shape_conditioned_scribble"],
             SKETCH_MODE_DEFAULTS["sketch_mask_fit_strength"],
             SKETCH_MODE_DEFAULTS["mask_contour_weight"],
-            SKETCH_MODE_DEFAULTS["frame_shaped_reference"],
+            strategy["frame_shaped_reference"],
+            strategy["frame_shaped_reference_object_scale"],
             request.seed,
             [("", "")],
         )
@@ -348,16 +377,26 @@ class LegacyBridge:
             [("", "")],
             request.seed,
             6.0,
-            SKETCH_MODE_DEFAULTS["dilate_size"],
+            strategy["dilate_size"],
             SKETCH_MODE_DEFAULTS["anydoor_guidance_scale"],
-            SKETCH_MODE_DEFAULTS["reference_propagation_mask_source"],
-            SKETCH_MODE_DEFAULTS["reference_motion_guide"],
-            SKETCH_MODE_DEFAULTS["edit_mask_mode"],
-            SKETCH_MODE_DEFAULTS["guide_dilate_size"],
+            strategy["reference_strategy"],
+            strategy["reference_propagation_mask_source"],
+            strategy["reference_motion_guide"],
+            strategy["edit_mask_mode"],
+            strategy["guide_dilate_size"],
             "off",
-            5,
+            0,
             0.08,
             False,
+            strategy["anydoor_pre_inpaint_mode"],
+            SKETCH_MODE_DEFAULTS["anydoor_background_prompt"],
+            SKETCH_MODE_DEFAULTS["anydoor_background_mask_dilate"],
+            SKETCH_MODE_DEFAULTS["anydoor_background_guidance_scale"],
+            SKETCH_MODE_DEFAULTS["anydoor_background_num_inference_steps"],
+            str(DEFAULT_CKPT_ROOT / "lama" / "big-lama.pt"),
+            SKETCH_MODE_DEFAULTS["anydoor_lama_mask_mode"],
+            SKETCH_MODE_DEFAULTS["anydoor_lama_mask_padding"],
+            SKETCH_MODE_DEFAULTS["anydoor_lama_mask_dilate"],
         )
         wait_for_legacy_flag(self.legacy, "inpainting", job, "Generating video")
 
@@ -630,7 +669,8 @@ def create_app(
         require_video(session)
         job = store.create_job(session.id, "sketch")
         if demo_mode:
-            bridge.finish_demo_job(session, job, "sketch", defaults=SKETCH_MODE_DEFAULTS)
+            defaults = {**SKETCH_MODE_DEFAULTS, **reference_strategy_settings(request.reference_strategy)}
+            bridge.finish_demo_job(session, job, "sketch", defaults=defaults)
             return job_payload(job)
 
         def run() -> None:
@@ -642,7 +682,8 @@ def create_app(
                 job.state = "succeeded"
                 job.stage = "Complete"
                 job.progress = 100
-                job.result = {"video_url": artifact_url(session.id, output), "defaults": SKETCH_MODE_DEFAULTS}
+                defaults = {**SKETCH_MODE_DEFAULTS, **reference_strategy_settings(request.reference_strategy)}
+                job.result = {"video_url": artifact_url(session.id, output), "defaults": defaults}
             except Exception as exc:
                 job.state = "failed"
                 job.error = str(exc)
@@ -670,13 +711,18 @@ def create_app(
 
         @app.get("/", include_in_schema=False)
         def get_frontend_index() -> FileResponse:
-            return FileResponse(index)
+            return FileResponse(index, headers={"Cache-Control": "no-store"})
 
         @app.get("/{path:path}", include_in_schema=False)
         def get_frontend_fallback(path: str) -> FileResponse:
             if path.startswith("api/"):
                 raise HTTPException(status_code=404, detail="Not Found")
-            return FileResponse(index)
+            asset_alias = assets / path
+            if asset_alias.exists() and asset_alias.is_file():
+                return FileResponse(asset_alias, headers={"Cache-Control": "no-cache"})
+            if Path(path).suffix in {".js", ".css", ".map", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".webp"}:
+                raise HTTPException(status_code=404, detail="Static asset not found")
+            return FileResponse(index, headers={"Cache-Control": "no-store"})
 
     return app
 
@@ -686,11 +732,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7862)
     parser.add_argument("--demo", action="store_true", help="Start without loading model weights; useful for frontend development.")
-    parser.add_argument("--model_path", type=str, default="../ckpt/CogVideoX-5b-I2V")
-    parser.add_argument("--inpainting_branch", type=str, default="../ckpt/VideoPainter/checkpoints/branch")
-    parser.add_argument("--id_adapter", type=str, default="../ckpt/VideoPainterID/checkpoints")
-    parser.add_argument("--img_inpainting_model", type=str, default="../ckpt/flux_inp")
-    parser.add_argument("--sam2_checkpoint", type=str, default="../ckpt/sam2_hiera_large.pt")
+    parser.add_argument("--model_path", type=str, default=str(DEFAULT_CKPT_ROOT / "CogVideoX-5b-I2V"))
+    parser.add_argument("--inpainting_branch", type=str, default=str(DEFAULT_CKPT_ROOT / "VideoPainter" / "checkpoints" / "branch"))
+    parser.add_argument("--id_adapter", type=str, default=str(DEFAULT_CKPT_ROOT / "VideoPainterID" / "checkpoints"))
+    parser.add_argument("--img_inpainting_model", type=str, default=str(DEFAULT_CKPT_ROOT / "flux_inp"))
+    parser.add_argument("--sam2_checkpoint", type=str, default=str(DEFAULT_CKPT_ROOT / "sam2_hiera_large.pt"))
     parser.add_argument("--gradio_port", type=int, default=7860)
     return parser.parse_args()
 

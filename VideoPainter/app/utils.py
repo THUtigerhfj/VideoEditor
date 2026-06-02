@@ -27,7 +27,7 @@ from openai import OpenAI
 from diffusers.utils import export_to_video, load_image, load_video
 from PIL import Image
 from safetensors import safe_open
-from frame_conditioning import build_first_frame_ground_truth_masks, build_masked_video_frames, finalize_propagation_sequence
+from frame_conditioning import build_first_frame_ground_truth_masks, build_lama_background_inpaint_mask, build_masked_video_frames, finalize_propagation_sequence
 from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
 
 # The VideoPainterID reference pipeline uses a non-zero previous-clip weight to
@@ -113,6 +113,168 @@ def build_reference_propagation_prompt(video_caption, target_object_caption):
     return f"{video_caption} Focus on keeping the replacement object as {target_object_caption}."
 
 
+def run_flux_fill_inpaint(
+    image,
+    mask_image,
+    pipe_img_inpainting,
+    prompt,
+    seed=42,
+    guidance_scale=30.0,
+    num_inference_steps=50,
+    max_sequence_length=512,
+    device="cuda",
+    video_pipe=None,
+):
+    """Run FLUX.1 Fill on one image/mask pair and return an RGB PIL image."""
+    if pipe_img_inpainting is None:
+        raise ValueError("FLUX background inpainting requires --img_inpainting_model")
+
+    image = image if isinstance(image, Image.Image) else Image.fromarray(np.asarray(image).astype(np.uint8)).convert("RGB")
+    mask_image = mask_image if isinstance(mask_image, Image.Image) else Image.fromarray(np.asarray(mask_image).astype(np.uint8)).convert("L")
+
+    flux_pipe = None
+    cpu_offload = os.environ.get("VIDEOPAINTER_CPU_OFFLOAD", "").lower()
+    moved_video_pipe = isinstance(pipe_img_inpainting, str) and video_pipe is not None and not cpu_offload
+    if moved_video_pipe:
+        video_pipe.to("cpu")
+        torch.cuda.empty_cache()
+
+    if isinstance(pipe_img_inpainting, str):
+        flux_pipe = FluxFillPipeline.from_pretrained(pipe_img_inpainting, torch_dtype=torch.bfloat16)
+        if cpu_offload:
+            flux_pipe.enable_model_cpu_offload(gpu_id=0)
+        else:
+            flux_pipe.to(device)
+    else:
+        flux_pipe = pipe_img_inpainting.to(device)
+
+    try:
+        result = flux_pipe(
+            prompt=str(prompt or "continuous surrounding background, same lighting, perspective, reflections, focus, and texture"),
+            image=image,
+            mask_image=mask_image,
+            height=image.size[1],
+            width=image.size[0],
+            guidance_scale=float(guidance_scale),
+            num_inference_steps=int(num_inference_steps),
+            max_sequence_length=int(max_sequence_length),
+            generator=torch.Generator("cpu").manual_seed(int(seed)),
+        ).images[0]
+    finally:
+        if flux_pipe is not None:
+            if hasattr(flux_pipe, "maybe_free_model_hooks"):
+                flux_pipe.maybe_free_model_hooks()
+            flux_pipe.to("cpu")
+        if isinstance(pipe_img_inpainting, str) and flux_pipe is not None:
+            del flux_pipe
+        torch.cuda.empty_cache()
+        if moved_video_pipe:
+            video_pipe.to(device)
+
+    return result.convert("RGB")
+
+
+def run_lama_inpaint(
+    image,
+    mask_image,
+    lama_model,
+    device="cuda",
+    video_pipe=None,
+):
+    """Run LaMa object-removal inpainting on one image/mask pair."""
+    if not lama_model:
+        raise ValueError("LaMa background inpainting requires --lama_model")
+    if not os.path.exists(str(lama_model)):
+        raise FileNotFoundError(f"LaMa model not found: {lama_model}")
+
+    image = image if isinstance(image, Image.Image) else Image.fromarray(np.asarray(image).astype(np.uint8)).convert("RGB")
+    mask_image = mask_image if isinstance(mask_image, Image.Image) else Image.fromarray(np.asarray(mask_image).astype(np.uint8)).convert("L")
+
+    cpu_offload = os.environ.get("VIDEOPAINTER_CPU_OFFLOAD", "").lower()
+    moved_video_pipe = video_pipe is not None and not cpu_offload
+    if moved_video_pipe:
+        video_pipe.to("cpu")
+        torch.cuda.empty_cache()
+
+    old_lama_model = os.environ.get("LAMA_MODEL")
+    os.environ["LAMA_MODEL"] = str(lama_model)
+    try:
+        from simple_lama_inpainting import SimpleLama
+
+        lama = SimpleLama(device=torch.device(device if torch.cuda.is_available() and str(device).startswith("cuda") else "cpu"))
+        result = lama(image, mask_image)
+    finally:
+        if old_lama_model is None:
+            os.environ.pop("LAMA_MODEL", None)
+        else:
+            os.environ["LAMA_MODEL"] = old_lama_model
+        if "lama" in locals():
+            lama.model.to("cpu")
+            del lama
+        torch.cuda.empty_cache()
+        if moved_video_pipe:
+            video_pipe.to(device)
+
+    return result.convert("RGB")
+
+
+def run_lama_video_inpaint(
+    images,
+    masks,
+    lama_model,
+    mask_mode="rect",
+    mask_padding=24,
+    mask_dilate=31,
+    device="cuda",
+    progress_callback=None,
+    output_dir=None,
+):
+    """Run LaMa cleanup on a sequence while preserving the original masks."""
+    if not lama_model:
+        raise ValueError("LaMa video cleanup requires --lama_model")
+    if not os.path.exists(str(lama_model)):
+        raise FileNotFoundError(f"LaMa model not found: {lama_model}")
+    if len(images) != len(masks):
+        raise ValueError(f"images/masks length mismatch: {len(images)} vs {len(masks)}")
+
+    old_lama_model = os.environ.get("LAMA_MODEL")
+    os.environ["LAMA_MODEL"] = str(lama_model)
+    try:
+        from simple_lama_inpainting import SimpleLama
+
+        lama = SimpleLama(device=torch.device(device if torch.cuda.is_available() and str(device).startswith("cuda") else "cpu"))
+        cleaned_images = []
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        for idx, (image, mask) in enumerate(zip(images, masks)):
+            image = image if isinstance(image, Image.Image) else Image.fromarray(np.asarray(image).astype(np.uint8)).convert("RGB")
+            cleanup_mask = build_lama_background_inpaint_mask(
+                mask,
+                mode=mask_mode,
+                padding=mask_padding,
+                dilate_size=mask_dilate,
+            )
+            cleanup_mask_pil = Image.fromarray(cleanup_mask).convert("L")
+            cleaned = lama(image.convert("RGB"), cleanup_mask_pil).convert("RGB")
+            cleaned_images.append(cleaned)
+            if output_dir and idx in {0, 1, len(images) - 1}:
+                cleaned.save(os.path.join(output_dir, f"lama_conditioning_frame_{idx:03d}.png"))
+                cleanup_mask_pil.save(os.path.join(output_dir, f"lama_conditioning_mask_{idx:03d}.png"))
+            if progress_callback:
+                progress_callback(idx + 1, len(images), f"LaMa cleaned conditioning frame {idx + 1}/{len(images)}")
+    finally:
+        if old_lama_model is None:
+            os.environ.pop("LAMA_MODEL", None)
+        else:
+            os.environ["LAMA_MODEL"] = old_lama_model
+        if "lama" in locals():
+            lama.model.to("cpu")
+            del lama
+        torch.cuda.empty_cache()
+
+    return cleaned_images
+
+
 def generate_frames(
         images,
         masks,
@@ -131,7 +293,7 @@ def generate_frames(
         guide_images=None,
         guide_mode="none",
         guide_dilate_size=None,
-        conditioning_video_mode="masked_video",
+        conditioning_video_mode="full_video",
     ):
     """
     Generate inpainted video frames.
@@ -192,46 +354,21 @@ def generate_frames(
         report_progress(current_step, total_steps, "Loading FLUX model for first frame inpainting...")
         current_step += 5
 
-        flux_pipe = None
-        cpu_offload = os.environ.get("VIDEOPAINTER_CPU_OFFLOAD", "").lower()
-        moved_video_pipe = isinstance(pipe_img_inpainting, str)
-        if isinstance(pipe_img_inpainting, str) and not cpu_offload:
-            pipe.to("cpu")
-            torch.cuda.empty_cache()
-        if isinstance(pipe_img_inpainting, str):
-            flux_pipe = FluxFillPipeline.from_pretrained(pipe_img_inpainting, torch_dtype=torch.bfloat16)
-            if cpu_offload:
-                flux_pipe.enable_model_cpu_offload(gpu_id=0)
-            else:
-                flux_pipe.to("cuda")
-        else:
-            flux_pipe = pipe_img_inpainting.to("cuda")
-
         report_progress(current_step, total_steps, "Running FLUX inpainting (50 steps)...")
         current_step += 20
 
-        try:
-            image_inpainting = flux_pipe(
-                prompt=image_inpainting_prompt,
-                image=images[0],
-                mask_image=masks[0],
-                height=images[0].size[1],
-                width=images[0].size[0],
-                guidance_scale=30,
-                num_inference_steps=50,
-                max_sequence_length=512,
-                generator=torch.Generator("cpu").manual_seed(seed)
-            ).images[0]
-        finally:
-            if flux_pipe is not None:
-                if hasattr(flux_pipe, "maybe_free_model_hooks"):
-                    flux_pipe.maybe_free_model_hooks()
-                flux_pipe.to("cpu")
-            if isinstance(pipe_img_inpainting, str) and flux_pipe is not None:
-                del flux_pipe
-            torch.cuda.empty_cache()
-            if moved_video_pipe and not cpu_offload:
-                pipe.to("cuda")
+        image_inpainting = run_flux_fill_inpaint(
+            image=images[0],
+            mask_image=masks[0],
+            pipe_img_inpainting=pipe_img_inpainting,
+            prompt=image_inpainting_prompt,
+            seed=seed,
+            guidance_scale=30,
+            num_inference_steps=50,
+            max_sequence_length=512,
+            device="cuda",
+            video_pipe=pipe,
+        )
         images[0] = image_inpainting
         print(f"Image inpainting done! {np.array(images[0]).shape}")
         report_progress(current_step, total_steps, "FLUX inpainting complete")

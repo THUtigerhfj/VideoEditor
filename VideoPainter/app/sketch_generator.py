@@ -76,6 +76,14 @@ def _ensure_snapshot(repo_id: str, cache_dir, device: str = "cuda"):
         return snapshot_download(**kwargs)
 
 
+def _from_pretrained_cache_first(loader, model_id: str, **kwargs):
+    try:
+        return loader.from_pretrained(model_id, local_files_only=True, **kwargs)
+    except Exception as local_error:
+        print(f"Local cache load failed for {model_id}; trying Hugging Face Hub: {local_error}")
+        return loader.from_pretrained(model_id, **kwargs)
+
+
 def _to_rgb(image: Image.Image) -> Image.Image:
     if not isinstance(image, Image.Image):
         image = Image.fromarray(np.asarray(image))
@@ -248,13 +256,15 @@ def build_sdxl_scribble_pipeline(cache_dir: str, device: str = "cuda"):
     variant = "fp16" if _is_cuda_device(device) else None
     _ensure_snapshot(SCRIBBLE_CONTROLNET_ID, cache_dir, device=device)
     _ensure_snapshot(SDXL_MODEL_ID, cache_dir, device=device)
-    controlnet = ControlNetModel.from_pretrained(
+    controlnet = _from_pretrained_cache_first(
+        ControlNetModel,
         SCRIBBLE_CONTROLNET_ID,
         torch_dtype=torch_dtype,
         cache_dir=cache_dir,
         use_safetensors=True,
     )
-    pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+    pipe = _from_pretrained_cache_first(
+        StableDiffusionXLControlNetPipeline,
         SDXL_MODEL_ID,
         controlnet=controlnet,
         torch_dtype=torch_dtype,

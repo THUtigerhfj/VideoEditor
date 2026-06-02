@@ -351,6 +351,34 @@ h1 {
   background: #2ae3ff;
 }
 
+.strategy-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 10px;
+  color: #9fb4c8;
+  background: linear-gradient(135deg, rgba(42, 227, 255, 0.1), rgba(135, 255, 215, 0.035));
+  border: 1px solid rgba(42, 227, 255, 0.18);
+}
+
+.strategy-card > span {
+  color: #e7fbff;
+  font-weight: 800;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.strategy-card p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.strategy-toggle {
+  margin-top: 0;
+}
+
 .primary-action {
   width: 100%;
   margin-top: 12px;

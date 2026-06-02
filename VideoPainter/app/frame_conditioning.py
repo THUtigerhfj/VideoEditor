@@ -55,6 +55,172 @@ def mask_geometry(mask):
     }
 
 
+def _scaled_center_crop_mask(mask, scale=0.82):
+    target = (_to_mask_array(mask) > 0).astype(np.uint8)
+    bbox = mask_bbox(target)
+    if bbox is None:
+        return target.astype(np.uint8) * 255
+    x0, y0, x1, y1 = bbox
+    width = x1 - x0 + 1
+    height = y1 - y0 + 1
+    scale = min(1.0, max(0.05, float(scale)))
+    crop_w = max(1, int(round(width * scale)))
+    crop_h = max(1, int(round(height * scale)))
+    cx = (x0 + x1 + 1) / 2.0
+    cy = (y0 + y1 + 1) / 2.0
+    cx0 = max(0, int(round(cx - crop_w / 2.0)))
+    cy0 = max(0, int(round(cy - crop_h / 2.0)))
+    cx1 = min(target.shape[1], cx0 + crop_w)
+    cy1 = min(target.shape[0], cy0 + crop_h)
+    crop = np.zeros_like(target, dtype=np.uint8)
+    crop[cy0:cy1, cx0:cx1] = 1
+    return (np.logical_and(target > 0, crop > 0).astype(np.uint8) * 255)
+
+
+def select_anydoor_target_mask(
+    reference_mask,
+    video_target_mask,
+    output_size=(720, 480),
+    min_overlap_ratio=0.25,
+    min_containment_ratio=0.98,
+    fallback_scale=0.82,
+    preserve_full_frame_reference=False,
+):
+    """Choose a full-frame AnyDoor placement mask in video coordinates.
+
+    Frame-shaped sketch references can provide a smaller object mask. Use it
+    only when it is already contained by the tracked video target. Otherwise,
+    build a smaller placement mask from the tracked video target itself so the
+    AnyDoor mask cannot drift outside the original edit region.
+    """
+    target = (_to_mask_array(video_target_mask) > 0).astype(np.uint8)
+    ref = (_to_mask_array(reference_mask) > 0).astype(np.uint8)
+    expected_shape = (int(output_size[1]), int(output_size[0]))
+    if target.shape != expected_shape:
+        raise ValueError(f"video_target_mask must have shape {expected_shape}, got {target.shape}")
+    target_area = max(int(target.sum()), 1)
+    if ref.shape == expected_shape and ref.any():
+        overlap = np.logical_and(ref > 0, target > 0).sum()
+        ref_area = max(int(ref.sum()), 1)
+        containment = overlap / ref_area
+        if preserve_full_frame_reference and containment >= float(min_containment_ratio):
+            return ref.astype(np.uint8) * 255
+        if containment >= float(min_containment_ratio) and ref_area < target_area * 0.95:
+            return ref.astype(np.uint8) * 255
+        if containment >= float(min_overlap_ratio) or target.any():
+            return _scaled_center_crop_mask(target, scale=fallback_scale)
+    if target.any():
+        return _scaled_center_crop_mask(target, scale=fallback_scale)
+    return target.astype(np.uint8) * 255
+
+
+def prepare_anydoor_target_image(
+    target_image,
+    video_target_mask,
+    anydoor_target_mask,
+    inpaint_radius=7,
+    erase_dilate_size=21,
+    erase_top_scale=0.45,
+    erase_side_scale=0.35,
+    erase_bottom_scale=0.08,
+):
+    """Remove the original target object before placing a smaller AnyDoor object.
+
+    When the AnyDoor placement mask is smaller than the clicked video mask, the
+    unedited target crop still contains the old large object. AnyDoor can then
+    preserve or regenerate that large object. Pre-inpainting the original target
+    mask gives AnyDoor a cleaner background around the smaller placement area.
+    """
+    image = _to_rgb_array(target_image).copy()
+    video_mask = (_to_mask_array(video_target_mask) > 0).astype(np.uint8)
+    placement_mask = (_to_mask_array(anydoor_target_mask) > 0).astype(np.uint8)
+    if video_mask.shape != placement_mask.shape or video_mask.shape != image.shape[:2]:
+        return image
+    video_area = int(video_mask.sum())
+    placement_area = int(placement_mask.sum())
+    if video_area == 0 or placement_area == 0 or placement_area >= video_area * 0.95:
+        return image
+    inpaint_mask = (video_mask * 255).astype(np.uint8)
+    kernel_size = max(1, int(erase_dilate_size))
+    if kernel_size > 1:
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        inpaint_mask = cv2.dilate(inpaint_mask, kernel, iterations=1)
+    bbox = mask_bbox(inpaint_mask)
+    if bbox is not None:
+        x0, y0, x1, y1 = bbox
+        width = x1 - x0 + 1
+        height = y1 - y0 + 1
+        pad = max(0, kernel_size // 2)
+        x0 = max(0, x0 - pad - int(round(width * float(erase_side_scale))))
+        y0 = max(0, y0 - pad - int(round(height * float(erase_top_scale))))
+        x1 = min(image.shape[1] - 1, x1 + pad + int(round(width * float(erase_side_scale))))
+        y1 = min(image.shape[0] - 1, y1 + pad + int(round(height * float(erase_bottom_scale))))
+        inpaint_mask[y0 : y1 + 1, x0 : x1 + 1] = 255
+    return cv2.inpaint(image, inpaint_mask, int(inpaint_radius), cv2.INPAINT_TELEA)
+
+
+def build_anydoor_background_inpaint_mask(
+    video_target_mask,
+    preserve_mask=None,
+    dilate_size=0,
+):
+    """Build the FLUX mask for cleaning the AnyDoor target frame.
+
+    The default is the tracked frame-0 video target mask. Do not expand it:
+    FLUX.1 Fill should see the original object region and infer the missing
+    background from surrounding pixels. `preserve_mask` is kept only as an
+    explicit experimental option for ring cleanup and is not used by defaults.
+    """
+    mask = (_to_mask_array(video_target_mask) > 0).astype(np.uint8) * 255
+    if mask.max() == 0:
+        return mask
+    kernel_size = max(0, int(dilate_size))
+    if kernel_size > 1:
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+    if preserve_mask is not None:
+        preserve = _to_mask_array(preserve_mask)
+        if preserve.shape != mask.shape:
+            preserve = cv2.resize(preserve, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+        background_ring = mask.copy()
+        background_ring[preserve > 0] = 0
+        return background_ring.astype(np.uint8)
+    return mask.astype(np.uint8)
+
+
+def build_lama_background_inpaint_mask(video_target_mask, mode="rect", padding=24, dilate_size=31):
+    """Build a stronger object-removal mask for LaMa background cleanup.
+
+    LaMa is prompt-free, so an expanded rectangular or dilated mask is often
+    better for removing residual object rims and transparent reflections.
+    """
+    mask = (_to_mask_array(video_target_mask) > 0).astype(np.uint8) * 255
+    if mask.max() == 0:
+        return mask
+    mode = str(mode or "rect").lower()
+    if mode == "exact":
+        return mask.astype(np.uint8)
+    if mode == "dilate":
+        kernel_size = max(1, int(dilate_size))
+        if kernel_size > 1:
+            kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+            mask = cv2.dilate(mask, kernel, iterations=1)
+        return mask.astype(np.uint8)
+    if mode != "rect":
+        raise ValueError(f"Unsupported LaMa background mask mode: {mode}")
+    bbox = mask_bbox(mask)
+    if bbox is None:
+        return mask.astype(np.uint8)
+    x0, y0, x1, y1 = bbox
+    pad = max(0, int(padding))
+    rect = np.zeros_like(mask, dtype=np.uint8)
+    rect[
+        max(0, y0 - pad) : min(mask.shape[0], y1 + pad + 1),
+        max(0, x0 - pad) : min(mask.shape[1], x1 + pad + 1),
+    ] = 255
+    return rect
+
+
 def _bbox_to_center_size(bbox):
     x0, y0, x1, y1 = bbox
     return {
