@@ -249,6 +249,20 @@ inputs/
 runs/
 tests/
 VideoPainter/app/tmp_gradio
+VideoPainter/app/tmp_api
 VideoPainter/ckpt/sketch_ref
 instruction.md
+node_modules/
+package-lock.json
+package.json
 
+!frontend/
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/index.html
+!frontend/tsconfig.json
+!frontend/src/
+!frontend/src/**
