@@ -22,7 +22,7 @@ import gradio as gr
 from sam2.build_sam import build_sam2_video_predictor, build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-from frame_conditioning import build_anydoor_background_inpaint_mask, build_edge_refine_masks, build_lama_background_inpaint_mask, build_union_edit_masks, composite_object_guide_frames, finalize_propagation_sequence, mask_bbox, mask_bbox_trajectory, prepare_anydoor_target_image, select_anydoor_target_mask, smooth_mask_bboxes
+from frame_conditioning import build_anydoor_background_inpaint_mask, build_edge_refine_masks, build_lama_background_inpaint_mask, build_union_edit_masks, composite_object_guide_frames, finalize_propagation_sequence, mask_bbox, mask_bbox_trajectory, prepare_anydoor_target_image, select_anydoor_target_mask_for_strategy, smooth_mask_bboxes
 from reference_segmenter import clean_binary_mask, detect_object_box_with_grounding_dino, segment_box_with_sam2
 from utils import REFERENCE_PREV_CLIP_WEIGHT, build_reference_propagation_prompt, load_model, generate_frames, run_flux_fill_inpaint, run_lama_inpaint, run_lama_video_inpaint
 import threading
@@ -765,11 +765,11 @@ def exact_replace_video_background(video_state, ref_image_input, ref_mask, video
             tar_image = np.array(validation_images[0]).copy()
             tar_mask_arr = (validation_masks[0] > 128).astype(np.uint8) * 255
             ref_mask_arr = (np.array(ref_mask) > 0).astype(np.uint8) * 255
-            anydoor_target_mask_arr = select_anydoor_target_mask(
+            anydoor_target_mask_arr = select_anydoor_target_mask_for_strategy(
                 ref_mask_arr,
                 tar_mask_arr,
+                strategy["reference_strategy"],
                 output_size=(720, 480),
-                preserve_full_frame_reference=strategy["reference_strategy"] == "mask_twist",
             )
             anydoor_pre_inpaint_mode_value = anydoor_pre_inpaint_mode or "lama"
             background_mask_arr = None

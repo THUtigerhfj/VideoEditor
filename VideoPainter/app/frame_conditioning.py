@@ -114,6 +114,27 @@ def select_anydoor_target_mask(
     return target.astype(np.uint8) * 255
 
 
+def select_anydoor_target_mask_for_strategy(
+    reference_mask,
+    video_target_mask,
+    reference_strategy,
+    output_size=(720, 480),
+):
+    """Select the AnyDoor target mask without changing LaMa-clean behavior.
+
+    mask_twist is the strict same-shape path: AnyDoor and CogVideoX must see the
+    same frame-0 target region. LaMa-clean keeps the smaller-object placement
+    behavior implemented by select_anydoor_target_mask().
+    """
+    target = (_to_mask_array(video_target_mask) > 0).astype(np.uint8)
+    expected_shape = (int(output_size[1]), int(output_size[0]))
+    if target.shape != expected_shape:
+        raise ValueError(f"video_target_mask must have shape {expected_shape}, got {target.shape}")
+    if reference_strategy == "mask_twist":
+        return target.astype(np.uint8) * 255
+    return select_anydoor_target_mask(reference_mask, video_target_mask, output_size=output_size)
+
+
 def prepare_anydoor_target_image(
     target_image,
     video_target_mask,
