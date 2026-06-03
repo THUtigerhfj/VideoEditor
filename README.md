@@ -26,6 +26,7 @@ Notes:
 - Sketch-to-reference model loaders use local Hugging Face cache first and only try the Hub if the required model is not available locally. The default cache directory is `/root/autodl-tmp/VideoEditor/VideoPainter/ckpt/sketch_ref`.
 - Reference/sketch replacement now defaults to prompt-free LaMa cleanup before AnyDoor. The local LaMa model path is `/root/autodl-tmp/VideoEditor/VideoPainter/ckpt/lama/big-lama.pt`.
 - Gradio exposes `Reference Strategy` with two presets: `lama_background` and `mask_twist`.
+- Reference/sketch exact replacement saves the edited first frame separately and returns a tail video without frame 0. This matches the current assumption that CogVideoX does not regenerate frame 0; the comparable first-frame artifact is saved as `exact_replace_first_frame.png`.
 
 ## Run The React Studio UI
 
@@ -82,7 +83,7 @@ Use this for the current sketch/reference demo path.
 - AnyDoor uses the smaller reference-object mask as its target mask, so the replacement object can be smaller than the original source mask.
 - CogVideoX still receives the original clicked video mask sequence.
 - Later conditioning frames are cleaned with LaMa using `conditioning_video_mode=lama_cleaned_video` and `conditioning_lama_mask_padding=48`.
-- `dilate_size=0`, so the CogVideoX edit mask is not expanded.
+- `dilate_size=0` and `guide_dilate_size=0`, so the CogVideoX edit mask is not expanded by default.
 
 ### `mask_twist`
 
@@ -90,9 +91,11 @@ Use this when you want the generated reference to match the original target mask
 
 - Sketch reference is shape-conditioned and fitted to the original frame-0 target bbox at scale `1.0`.
 - AnyDoor pre-inpaint is disabled by default.
+- AnyDoor receives the original video frame-0 target mask as its target mask.
 - CogVideoX uses `conditioning_video_mode=full_video`.
 - The original video target mask sequence is kept for propagation and editing.
 - This is closer to the older “twist/fit into original video mask” behavior. It can be more stable when the replacement sketch has nearly the same silhouette as the original object, but it gives less room for background completion inside the mask.
+- Important limitation: AnyDoor is generative replacement, not strict alpha-mask paste. Even when the reference mask, AnyDoor target mask, and CogVideoX frame-0 mask are identical, AnyDoor may still alter the object silhouette or orientation inside the target bbox.
 
 ## Sketch Reference Workflow
 
@@ -105,6 +108,7 @@ Sketch input is always treated as a sketch, not as a photo. The pipeline is:
 5. Save `reference_image.png`, `reference_mask.png`, candidate artifacts, and metadata.
 6. Feed the selected reference into AnyDoor for frame-0 replacement.
 7. Feed the AnyDoor first frame, masks, and prompts into VideoPainter/CogVideoX.
+8. Save the edited first frame separately and return the generated tail video without frame 0 for UI/Gradio exact replacement.
 
 Gradio usage:
 
@@ -194,6 +198,24 @@ Debug outputs:
 - `first_frames/anydoor_first_frame.png`
 
 Known limitation: LaMa can leave a mild smudge or blur inside the removed area. In the current bottle sample, `rect` mode with `padding=24` removed the duplicate old object and produced an AnyDoor first frame with only one replacement object, but the background is not perfectly clean.
+
+## Exact Replacement Outputs And Debug Files
+
+UI/Gradio exact replacement currently trims frame 0 from the returned result video because frame 0 comes from the external first-frame edit stage rather than CogVideoX generation. Inspect frame 0 and masks through saved debug files:
+
+- `VideoPainter/app/tmp_gradio/inpaint/first_frame_anydoor.png`
+- `VideoPainter/app/tmp_gradio/inpaint/exact_replace_first_frame.png`
+- `VideoPainter/app/tmp_gradio/inpaint/exact_replace_tail_<video_name>`
+- `VideoPainter/app/tmp_gradio/inpaint/anydoor_target_input.png`
+- `VideoPainter/app/tmp_gradio/inpaint/anydoor_target_mask.png`
+- `VideoPainter/app/tmp_gradio/inpaint/cogvideox_video_target_first_mask.png`
+- `VideoPainter/app/tmp_gradio/inpaint/propagation_first_mask.png`
+
+The CLI path still writes run-directory outputs, including `outputs/image_reference_videopainter_48f.mp4` and `outputs/image_reference_videopainter_49f_with_first.mp4` when that mode is used.
+
+## AnyDoor Mask Limitation
+
+The current AnyDoor bridge passes masks correctly, but AnyDoor's `run_inference.py` path uses the target mask mainly to derive the target bbox and conditioning crop. It also uses a rectangular collage region inside that crop. It is therefore not guaranteed to preserve an exact mask-shaped silhouette. If exact pixel-level mask conformity is required, a later implementation must add a post-AnyDoor warp/composite step or switch to a stricter shape-control path.
 
 ## Reference Guide And Edit Mask Modes
 
