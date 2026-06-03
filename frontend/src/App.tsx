@@ -23,6 +23,12 @@ import { api, apiBase, assetUrl, JobPayload, Mode, PointLabel, SessionPayload } 
 type Notice = { tone: "info" | "success" | "error"; text: string };
 type ReferenceStrategy = "lama_background" | "mask_twist";
 
+const promptModeDefaults = {
+  seed: 42,
+  cfgScale: 6,
+  dilateSize: 16,
+};
+
 const modes: Array<{ id: Mode; label: string; icon: typeof Sparkles }> = [
   { id: "prompt", label: "Prompt", icon: Sparkles },
   { id: "image", label: "Image", icon: ImageIcon },
@@ -107,9 +113,9 @@ function App() {
   const [videoCaption, setVideoCaption] = useState("A cinematic product shot with stable lighting and natural motion.");
   const [targetCaption, setTargetCaption] = useState("a clean metallic can");
   const [attrs, setAttrs] = useState("metallic, realistic, studio lighting");
-  const [seed, setSeed] = useState(42);
-  const [cfgScale, setCfgScale] = useState(6);
-  const [dilateSize, setDilateSize] = useState(0);
+  const [seed, setSeed] = useState(promptModeDefaults.seed);
+  const [cfgScale, setCfgScale] = useState(promptModeDefaults.cfgScale);
+  const [dilateSize, setDilateSize] = useState(promptModeDefaults.dilateSize);
   const [referenceStrategy, setReferenceStrategy] = useState<ReferenceStrategy>("lama_background");
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [activeJob, setActiveJob] = useState<JobPayload | null>(null);
@@ -786,7 +792,7 @@ function AdvancedDrawer({
         <strong>{cfgScale.toFixed(1)}</strong>
       </label>
       <label>
-        <span>Dilate size</span>
+        <span>Prompt dilate size</span>
         <input type="range" min="0" max="32" step="1" value={dilateSize} onChange={(event) => setDilateSize(Number(event.target.value))} />
         <strong>{dilateSize}</strong>
       </label>

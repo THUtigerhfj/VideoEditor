@@ -36,6 +36,25 @@ REFERENCE_STRATEGIES = {
 }
 
 
+PROMPT_MODE_DEFAULTS = {
+    "seed": 42,
+    "cfg_scale": 6.0,
+    # Match the initial commit's prompt inpainting behavior. Prompt mode needs
+    # a blending margin around the clicked mask for natural boundary synthesis.
+    "dilate_size": 16,
+}
+
+
+IMAGE_MODE_DEFAULTS = {
+    "reference_strategy": REFERENCE_STRATEGY_LAMA,
+    "seed": 42,
+    "cfg_scale": 6.0,
+    "dilate_size": 0,
+    "guide_dilate_size": 0,
+    "anydoor_guidance_scale": 5.0,
+}
+
+
 def normalize_reference_strategy(value):
     return value if value in REFERENCE_STRATEGIES else REFERENCE_STRATEGY_LAMA
 

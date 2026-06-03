@@ -268,3 +268,4 @@ frontend/tsconfig.tsbuildinfo
 !frontend/src/**
 
 report
+poster

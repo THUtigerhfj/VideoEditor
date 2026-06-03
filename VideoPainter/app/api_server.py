@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from PIL import Image, ImageDraw
 import numpy as np
 
-from sketch_defaults import SKETCH_MODE_DEFAULTS, reference_strategy_settings
+from sketch_defaults import IMAGE_MODE_DEFAULTS, PROMPT_MODE_DEFAULTS, SKETCH_MODE_DEFAULTS, reference_strategy_settings
 
 VIDEO_PAINTER_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CKPT_ROOT = VIDEO_PAINTER_ROOT / "ckpt"
@@ -35,15 +35,15 @@ class TargetPointRequest(BaseModel):
 class PromptGenerateRequest(BaseModel):
     video_caption: str = ""
     target_region_caption: str = ""
-    seed: int = 42
-    cfg_scale: float = 6.0
-    dilate_size: int = 8
+    seed: int = PROMPT_MODE_DEFAULTS["seed"]
+    cfg_scale: float = PROMPT_MODE_DEFAULTS["cfg_scale"]
+    dilate_size: int = PROMPT_MODE_DEFAULTS["dilate_size"]
 
 
 class ImageGenerateRequest(PromptGenerateRequest):
-    reference_strategy: str = SKETCH_MODE_DEFAULTS["reference_strategy"]
-    dilate_size: int = 0
-    anydoor_guidance_scale: float = 5.0
+    reference_strategy: str = IMAGE_MODE_DEFAULTS["reference_strategy"]
+    dilate_size: int = IMAGE_MODE_DEFAULTS["dilate_size"]
+    anydoor_guidance_scale: float = IMAGE_MODE_DEFAULTS["anydoor_guidance_scale"]
     anydoor_pre_inpaint_mode: str = "lama"
     anydoor_background_prompt: str = "unoccupied tabletop and laptop keyboard area, continuous desk and laptop surfaces matching the surrounding scene, same lighting, perspective, reflections, focus, and background texture"
     anydoor_background_mask_dilate: int = 0
@@ -56,7 +56,7 @@ class ImageGenerateRequest(PromptGenerateRequest):
     reference_propagation_mask_source: str = "video_target"
     reference_motion_guide: str = "none"
     edit_mask_mode: str = "propagation"
-    guide_dilate_size: int = 0
+    guide_dilate_size: int = IMAGE_MODE_DEFAULTS["guide_dilate_size"]
     mask_bbox_smoothing: str = "off"
     mask_bbox_smoothing_window: int = 0
     mask_bbox_max_scale_delta: float = 0.08
@@ -457,12 +457,21 @@ def session_payload(session: EditSession) -> Dict[str, Any]:
 
 
 def has_nonempty_mask(video_state: Any) -> bool:
-    if not video_state or not video_state.get("masks"):
+    if video_state is None:
+        return False
+    masks = video_state.get("masks") if isinstance(video_state, dict) else None
+    if masks is None:
         return False
     try:
-        return any(np.asarray(mask).max() > 0 for mask in video_state["masks"])
+        masks_arr = np.asarray(masks)
+        if masks_arr.size == 0:
+            return False
+        return bool(masks_arr.max() > 0)
     except Exception:
-        return bool(video_state.get("masks"))
+        try:
+            return any(np.asarray(mask).size > 0 and np.asarray(mask).max() > 0 for mask in masks)
+        except Exception:
+            return False
 
 
 def require_video(session: EditSession) -> None:

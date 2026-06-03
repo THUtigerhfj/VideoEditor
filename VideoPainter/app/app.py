@@ -27,7 +27,7 @@ from reference_segmenter import clean_binary_mask, detect_object_box_with_ground
 from utils import REFERENCE_PREV_CLIP_WEIGHT, build_reference_propagation_prompt, load_model, generate_frames, run_flux_fill_inpaint, run_lama_inpaint, run_lama_video_inpaint
 import threading
 from anydoor_bridge import replace_first_frame_with_anydoor
-from sketch_defaults import REFERENCE_STRATEGY_LABELS, SKETCH_MODE_DEFAULTS, reference_strategy_settings
+from sketch_defaults import PROMPT_MODE_DEFAULTS, REFERENCE_STRATEGY_LABELS, SKETCH_MODE_DEFAULTS, reference_strategy_settings
 from sketch_reference_workflow import build_reference_preview, generate_reference_assets, load_reference_assets_for_ui
 
 # Gradio temp directory (absolute path)
@@ -1441,7 +1441,7 @@ def main():
                 with gr.Accordion("Advanced Settings", open=False):
                     seed_param = gr.Number(label="Seed (-1 for random)", value=42, minimum=-1)
                     cfg_scale = gr.Slider(label="CFG Scale", value=6.0, minimum=1.0, maximum=10.0, step=0.1)
-                    dilate_size = gr.Slider(label="Dilate Size", value=SKETCH_MODE_DEFAULTS["dilate_size"], minimum=0, maximum=32, step=1)
+                    dilate_size = gr.Slider(label="Prompt Dilate Size", value=PROMPT_MODE_DEFAULTS["dilate_size"], minimum=0, maximum=32, step=1)
 
                 video_info = gr.Textbox(label="Video Info", interactive=False)
 

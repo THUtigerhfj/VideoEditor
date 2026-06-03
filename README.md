@@ -74,6 +74,8 @@ The Vite dev server talks to the API on `http://127.0.0.1:7862` by default. Over
 
 React Studio and Gradio both expose the same two reference/sketch replacement presets.
 
+Prompt mode has its own defaults and does not use these reference strategy presets. Its `dilate_size` default is `16`, matching the initial prompt-inpainting demo behavior.
+
 ### `lama_background` (default)
 
 Use this for the current sketch/reference demo path.
