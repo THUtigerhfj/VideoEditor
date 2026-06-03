@@ -1029,14 +1029,21 @@ def exact_replace_video_background(video_state, ref_image_input, ref_mask, video
                 images = images[:original_count]
 
             print(f"Generated frames shape: {images.shape}")
+            first_frame_output_path = os.path.join(GRADIO_TEMP_DIR, "inpaint", "exact_replace_first_frame.png")
+            Image.fromarray(images[0]).save(first_frame_output_path)
+            video_frames = images[1:] if len(images) > 1 else images
+            print(
+                "Returning UI video without frame 0: "
+                f"{len(video_frames)} frames. First frame saved separately: {first_frame_output_path}"
+            )
 
             # Generate output video
             with processing_lock:
                 processing_status["inpainting_message"] = "Stage 3/3: Generating output video..."
             print("Stage 3/3: Generating output video...")
             video_output = generate_video_from_frames(
-                images,
-                output_path=os.path.join(GRADIO_TEMP_DIR, "inpaint", f"exact_replace_{video_state['video_name']}"),
+                video_frames,
+                output_path=os.path.join(GRADIO_TEMP_DIR, "inpaint", f"exact_replace_tail_{video_state['video_name']}"),
                 fps=8
             )
 
